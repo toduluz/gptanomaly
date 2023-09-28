@@ -254,7 +254,7 @@ def parse_args():
     parser.add_argument(
         "--max_target_length",
         type=int,
-        default=128,
+        default=100,
         help=(
             "The maximum total sequence length for label text after "
             "tokenization. Sequences longer than this will be truncated, sequences shorter will be padded."
@@ -838,14 +838,15 @@ def main():
 
         gen_kwargs = {
             "max_new_tokens": args.max_target_length,
-            "num_beams": args.num_beams,
+            # "num_beams": args.num_beams,
             "pad_token_id": tokenizer.eos_token_id,
+            "do_sample": True
         }
         for step, batch in enumerate(eval_dataloader):
             with torch.no_grad():
                 generated_tokens = accelerator.unwrap_model(model).generate(
                     batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
+                    attention_mask=batch["attention_mask"], top_k=1,
                     **gen_kwargs,
                 )
 

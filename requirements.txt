@@ -11,3 +11,5 @@ accelerate
 fairscale
 regex
 deepspeed
+evaluate
+git+https://github.com/huggingface/transformers

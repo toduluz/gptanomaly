@@ -216,8 +216,8 @@ if __name__ == "__main__":
     #mins
     window_size = 50
     step_size = 50
-    train_ratio = 0.7
-    val_ratio = 0.1
+    train_ratio = 0.8
+    # val_ratio = 0.1
 
     #########
     # sample raw data
@@ -274,6 +274,8 @@ if __name__ == "__main__":
     train = train[train["labels"] == 0]
     train['text'] = train['text'].apply(lambda x: '|'.join(x))
     train = train.loc[:, ['text', 'labels']]
+    train = train.sample(frac=1)
+    train = train[:50000]
 
     print("training size {}".format(len(train)))
     train.to_csv(output_dir + "train.csv", index=False)
@@ -281,21 +283,26 @@ if __name__ == "__main__":
     # ###############
     # #     Val     #
     # ###############
-    val_len = int(df_len * val_ratio)
-    validation = deeplog_df[train_len:train_len+val_len]
-    validation['text'] = validation['text'].apply(lambda x: '|'.join(x))
-    validation = validation.loc[:, ['text', 'labels']]
+    # val_len = int(df_len * val_ratio)
+    # validation = deeplog_df[train_len:train_len+val_len]
+    # validation['text'] = validation['text'].apply(lambda x: '|'.join(x))
+    # validation = validation.loc[:, ['text', 'labels']]
 
-    print("validation size {}".format(len(validation)))
-    print("validation anomaly {} %".format(len(validation[validation["labels"] == 1]) / len(validation) *100))
-    validation.to_csv(output_dir + "validation.csv", index=False)
+    # print("validation size {}".format(len(validation)))
+    # print("validation anomaly {} %".format(len(validation[validation["labels"] == 1]) / len(validation) *100))
+    # validation.to_csv(output_dir + "validation.csv", index=False)
 
     # ###############
     # #     Test    #
     # ###############
-    test = deeplog_df[train_len+val_len:]
+    test = deeplog_df[train_len:]
     test['text'] = test['text'].apply(lambda x: '|'.join(x))
     test = test.loc[:, ['text', 'labels']]
+    test_normal = test[test["labels"] == 0]
+    test_normal = test_normal[:9000]
+    test_abnormal = test[test["labels"] == 1]
+    test_abnormal = test_abnormal[:1000]
+    test = pd.concat([test_normal, test_abnormal]).sample(frac=1, random_state=20)
 
     print("test size {}".format(len(test)))
     print("test anomaly {} %".format(len(test[test["labels"] == 1]) / len(test) *100))

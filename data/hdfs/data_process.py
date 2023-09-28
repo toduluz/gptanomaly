@@ -140,16 +140,23 @@ def generate_train_test(hdfs_sequence_file):
     seq = seq[["text", "labels"]]
     # print(type(seq["text"][0]))
 
-    train_ratio = 0.7
-    val_ratio = 0.1
+    train_ratio = 0.8
+    # val_ratio = 0.1
 
     seq_len = len(seq)
     train_len = int(seq_len * train_ratio)
-    val_len = int(seq_len * val_ratio)
+    # val_len = int(seq_len * val_ratio)
     train = seq[:train_len]
     train = train[train["labels"] == 0]
-    validation = seq[train_len:train_len+val_len]
-    test = seq[train_len+val_len:]
+    train = train.sample(frac=1)
+    train = train[:50000]
+    # validation = seq[train_len:train_len+val_len]
+    test = seq[train_len:]
+    test_normal = test[test["labels"] == 0]
+    test_normal = test_normal[:9000]
+    test_abnormal = test[test["labels"] == 1]
+    test_abnormal = test_abnormal[:1000]
+    test = pd.concat([test_normal, test_abnormal]).sample(frac=1, random_state=20)
 
     # train.rename(columns={"EventSequence":"text", "Label":"labels"}, inplace=True)
     # validation.rename(columns={"EventSequence":"text", "Label":"labels"}, inplace=True)
@@ -157,16 +164,18 @@ def generate_train_test(hdfs_sequence_file):
     # train.sort_index(inplace=True)
 
     train_len = len(train)
-    val_len = len(validation)
+    # val_len = len(validation)
     test_len = len(test)
-    val_anomaly = len(validation[validation["labels"] == 1]) / val_len *100
+    # val_anomaly = len(validation[validation["labels"] == 1]) / val_len *100
     test_anomaly = len(test[test["labels"] == 1]) / test_len *100
    
-    print("train size {0}, validation size {1}, test size {2}".format(train_len, val_len, test_len))
-    print("validation anomaly {0} %, test anomaly {1} %".format(val_anomaly, test_anomaly))
+    # print("train size {0}, validation size {1}, test size {2}".format(train_len, val_len, test_len))
+    # print("validation anomaly {0} %, test anomaly {1} %".format(val_anomaly, test_anomaly))
+    print("train size {0}, test size {1}".format(train_len, test_len))
+    print("test anomaly {0} %".format(test_anomaly))
 
     train.to_csv(output_dir + "train.csv", index=False)
-    validation.to_csv(output_dir + "validation.csv", index=False)
+    # validation.to_csv(output_dir + "validation.csv", index=False)
     test.to_csv(output_dir + "test.csv", index=False)
     print("generate train validation test data done")
 
