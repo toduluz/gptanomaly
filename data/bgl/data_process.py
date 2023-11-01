@@ -5,56 +5,63 @@ import os
 import gc
 import pandas as pd
 import numpy as np
-from logparser import Spell, Drain
-import argparse
 from tqdm import tqdm
-# from logdeep.dataset.session import sliding_window
+from session import sliding_window, session_window, session_window_bgl, fixed_window
+from logparser import Spell, Drain
+import shutil
+import pickle
+from sklearn.utils import shuffle
+import json
+import random
 
-tqdm.pandas()
-pd.options.mode.chained_assignment = None
-
-PAD = 0
-UNK = 1
-START = 2
-
-data_dir = os.path.expanduser("./")
-output_dir = "./"
-log_file = "BGL.log"
-
+# tqdm.pandas()
+# pd.options.mode.chained_assignment = None  # default='warn'
+def seed_everything(seed=42):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    # torch.manual_seed(seed)
 
 # In the first column of the log, "-" indicates non-alert messages while others are alert messages.
-def count_anomaly():
+def _count_anomaly(log_path):
     total_size = 0
     normal_size = 0
-    with open(data_dir + log_file, encoding="utf8") as f:
+    with open(log_path, errors='ignore') as f:
         for line in f:
             total_size += 1
-            if line.split(' ',1)[0] == '-':
+            if line.split(' ')[0] == '-':
                 normal_size += 1
-    print("total size {}, abnormal size {}".format(total_size, total_size - normal_size))
+    print("total size {}, abnormal size {}, abnormal size % {}%".format(total_size, total_size - normal_size, ((total_size-normal_size)/total_size*100)))
 
 
-# def deeplog_df_transfer(df, features, target, time_index, window_size):
-#     """
-#     :param window_size: offset datetime https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#dateoffset-objects
-#     :return:
-#     """
-#     agg_dict = {target:'max'}
-#     for f in features:
-#         agg_dict[f] = _custom_resampler
+def sample_raw_data(data_file, output_file, sample_window_size, sample_step_size):
+    """
+    only sample supercomputer dataset such as bgl
+    """
+    sample_data = []
+    labels = []
+    idx = 0
 
-#     features.append(target)
-#     features.append(time_index)
-#     df = df[features]
-#     deeplog_df = df.set_index(time_index).resample(window_size).agg(agg_dict).reset_index()
-#     return deeplog_df
+    with open(data_file, 'r', errors='ignore') as f:
+        for line in f:
+            labels.append(line.split()[0] != '-')
+            sample_data.append(line)
+
+            if len(labels) == sample_window_size:
+                abnormal_rate = sum(np.array(labels)) / len(labels)
+                print(f"{idx + 1} lines, abnormal rate {abnormal_rate}")
+                break
+
+            idx += 1
+            if idx % sample_step_size == 0:
+                print(f"Process {round(idx / sample_window_size * 100, 4)} % raw data", end='\r')
+
+    with open(output_file, "w") as f:
+        f.writelines(sample_data)
+    print("Sampling done")
 
 
-# def _custom_resampler(array_like):
-#     return list(array_like)
-
-
-def deeplog_file_generator(filename, df, features):
+def _file_generator(filename, df, features):
     with open(filename, 'w') as f:
         for _, row in df.iterrows():
             for val in zip(*row[features]):
@@ -62,323 +69,267 @@ def deeplog_file_generator(filename, df, features):
             f.write('\n')
 
 
-def parse_log(input_dir, output_dir, log_file, parser_type):
-    log_format = '<Label> <Id> <Date> <Code1> <Time> <Code2> <Component1> <Component2> <Level> <Content>'
-    regex = [
-        r'(0x)[0-9a-fA-F]+', #hexadecimal
-        r'\d+.\d+.\d+.\d+',
-        # r'/\w+( )$'
-        r'\d+'
-    ]
-    keep_para = False
-    if parser_type == "drain":
-        # the hyper parameter is set according to http://jmzhu.logpai.com/pub/pjhe_icws2017.pdf
-        st = 0.3  # Similarity threshold
-        depth = 3  # Depth of all leaf nodes
-        parser = Drain.LogParser(log_format, indir=input_dir, outdir=output_dir, depth=depth, st=st, rex=regex, keep_para=keep_para)
-        parser.parse(log_file)
-    elif parser_type == "spell":
-        tau = 0.55
-        parser = Spell.LogParser(indir=data_dir, outdir=output_dir, log_format=log_format, tau=tau, rex=regex, keep_para=keep_para)
-        parser.parse(log_file)
-
-#
-# def merge_list(time, activity):
-#     time_activity = []
-#     for i in range(len(activity)):
-#         temp = []
-#         assert len(time[i]) == len(activity[i])
-#         for j in range(len(activity[i])):
-#             temp.append(tuple([time[i][j], activity[i][j]]))
-#         time_activity.append(np.array(temp))
-#     return time_activity
-
-def sliding_window(raw_data, para):
+def process_dataset(data_dir, output_dir, log_file, dataset_name, window_type, window_size, step_size, train_size,
+                    random_sample=False, session_type="entry"):
     """
-    split logs into sliding windows/session
-    :param raw_data: dataframe columns=[timestamp, label, eventid, time duration]
-    :param para:{window_size: seconds, step_size: seconds}
-    :return: dataframe columns=[eventids, time durations, label]
+    creating log sequences by sliding window
+    :param data_dir:
+    :param output_dir:
+    :param log_file:
+    :param window_size:
+    :param step_size:
+    :param train_size:
+    :return:
     """
-    log_size = raw_data.shape[0]
-    label_data, time_data = raw_data.iloc[:, 1], raw_data.iloc[:, 0]
-    logkey_data, deltaT_data = raw_data.iloc[:, 2], raw_data.iloc[:, 3]
-    new_data = []
-    start_end_index_pair = set()
-
-    start_time = time_data[0]
-    end_time = start_time + para["window_size"]
-    start_index = 0
-    end_index = 0
-
-    # get the first start, end index, end time
-    for cur_time in time_data:
-        if cur_time < end_time:
-            end_index += 1
-        else:
-            break
-
-    start_end_index_pair.add(tuple([start_index, end_index]))
-
-    # move the start and end index until next sliding window
-    num_session = 1
-    while end_index < log_size:
-        start_time = start_time + para['step_size']
-        end_time = start_time + para["window_size"]
-        for i in range(start_index, log_size):
-            if time_data[i] < start_time:
-                i += 1
-            else:
-                break
-        for j in range(end_index, log_size):
-            if time_data[j] < end_time:
-                j += 1
-            else:
-                break
-        start_index = i
-        end_index = j
-
-        # when start_index == end_index, there is no value in the window
-        if start_index != end_index:
-            start_end_index_pair.add(tuple([start_index, end_index]))
-
-        num_session += 1
-        if num_session % 1000 == 0:
-            print("process {} time window".format(num_session), end='\r')
-
-    for (start_index, end_index) in start_end_index_pair:
-        dt = deltaT_data[start_index: end_index].values
-        dt[0] = 0
-        new_data.append([
-            time_data[start_index: end_index].values,
-            max(label_data[start_index:end_index]),
-            logkey_data[start_index: end_index].values,
-            dt
-        ])
-
-    assert len(start_end_index_pair) == len(new_data)
-    print('there are %d instances (sliding windows) in this dataset\n' % len(start_end_index_pair))
-    return pd.DataFrame(new_data, columns=raw_data.columns)
-
-def fixed_window(raw_data, para):
-    """
-    split logs into sliding windows/session
-    :param raw_data: dataframe columns=[timestamp, label, eventid, time duration]
-    :param para:{window_size: seconds, step_size: seconds}
-    :return: dataframe columns=[eventids, time durations, label]
-    """
-    log_size = raw_data.shape[0]
-    label_data, time_data = raw_data.iloc[:, 1], raw_data.iloc[:, 0]
-    # print(label_data[:10])
-    logkey_data, deltaT_data, log_template_data = raw_data.iloc[:, 2], raw_data.iloc[:, 3], raw_data.iloc[:, 4]
-    content_data = raw_data.iloc[:, 5]
-    new_data = []
-    start_end_index_pair = set()
-
-    start_index = 0
-    num_session = 0
-    print(log_size)
-    while start_index < log_size:
-        end_index = min(start_index + int(para["window_size"]), log_size)
-        start_end_index_pair.add(tuple([start_index, end_index]))
-        start_index = start_index + int(para['step_size'])
-        num_session += 1
-        if num_session % 1000 == 0:
-            print("process {} time window".format(num_session), end='\r')
-
-    n_sess = 0
-    for (start_index, end_index) in start_end_index_pair:
-        new_data.append({
-            "Label": max(label_data[start_index:end_index]),
-            "EventId": logkey_data[start_index: end_index].values,
-            "EventTemplate": log_template_data[start_index: end_index].values,
-            "Seq": content_data[start_index: end_index].values,
-            "SessionId": n_sess
-        })
-        n_sess += 1
-
-    assert len(start_end_index_pair) == len(new_data)
-    print('there are %d instances (sliding windows) in this dataset\n' % len(start_end_index_pair))
-    return pd.DataFrame(new_data)
-
-if __name__ == "__main__":
-    #
-    #
-    # parser = argparse.ArgumentParser()
-    # parser.add_argument('-p', default=None, type=str, help="parser type")
-    # parser.add_argument('-w', default='T', type=str, help='window size(mins)')
-    # parser.add_argument('-s', default='1', type=str, help='step size(mins)')
-    # parser.add_argument('-r', default=0.4, type=float, help="train ratio")
-    # args = parser.parse_args()
-    # print(args)
-    #
-
-    ##########
-    # Parser #
-    #########
-
-    # parse_log(data_dir, output_dir, log_file, 'drain')
-
-    #########
-    # Count #
-    #########
-    # count_anomaly()
+    ########
+    # count anomaly
+    ########
+    _count_anomaly(data_dir + log_file)
 
     ##################
     # Transformation #
     ##################
-    # mins
-    window_size = 50
-    step_size = 50
-    train_ratio = 0.8
-    # val_ratio = 0.1
+    print("Loading", f'{data_dir}{log_file}_structured.csv')
+    df = pd.read_csv(f'{data_dir}{log_file}_structured.csv')
 
-    df = pd.read_csv(f'{output_dir}{log_file}_structured.csv')
+    # build log sequences
+    if window_type == "sliding":
+        # data preprocess
+        if 'bgl' in dataset_name:
+            df["datetime"] = pd.to_datetime(df['Time'], format='%Y-%m-%d-%H.%M.%S.%f')
+        else:
+            df['datetime'] = pd.to_datetime(df["Date"] + " " + df['Time'], format='%Y-%m-%d %H:%M:%S')
 
-    # data preprocess
-    df['datetime'] = pd.to_datetime(df['Time'], format='%Y-%m-%d-%H.%M.%S.%f')
-    df["Label"] = df["Label"].apply(lambda x: int(x != "-"))
-    df['timestamp'] = df["datetime"].values.astype(np.int64) // 10 ** 9
-    df['deltaT'] = df['datetime'].diff() / np.timedelta64(1, 's')
-    df['deltaT'].fillna(0)
-    # convert time to UTC timestamp
-    # df['deltaT'] = df['datetime'].apply(lambda t: (t - pd.Timestamp("1970-01-01")) // pd.Timedelta('1s'))
+        df["Label"] = df["Label"].apply(lambda x: int(x != "-"))
+        df['timestamp'] = df["datetime"].values.astype(np.int64) // 10 ** 9
+        df['deltaT'] = df['datetime'].diff() / np.timedelta64(1, 's')
+        df['deltaT'].fillna(0)
+        n_train = int(len(df) * train_size)
+        if session_type == "entry":
+            sliding = fixed_window
+        else:
+            sliding = sliding_window
+            window_size = float(window_size) * 60
+            step_size = float(step_size) * 60
+        print(random_sample)
+        if random_sample:
+            print("???")
+            window_df = sliding(df[["timestamp", "Label", "EventId", "deltaT", "EventTemplate", "Content"]],
+                                       para={"window_size": window_size,
+                                             "step_size": step_size})
+            window_df = shuffle(window_df).reset_index(drop=True)
+            n_train = int(len(window_df) * train_size)
+            train_window = window_df.iloc[:n_train, :].to_dict("records")
+            test_window = window_df.iloc[n_train:, :].to_dict("records")
+        else:
+            train_window = sliding(
+                df[["timestamp", "Label", "EventId", "deltaT", "EventTemplate", "Content"]].iloc[:n_train, :],
+                para={"window_size": window_size,
+                      "step_size": step_size})#.to_dict("records")
+            test_window = sliding(
+                df[["timestamp", "Label", "EventId", "deltaT", "EventTemplate", "Content"]].iloc[n_train:, :].reset_index(
+                    drop=True),
+                para={"window_size": window_size, "step_size": step_size})#.to_dict("records")
 
-    # print(df.columns)
+    elif window_type == "session":
+        # only for hdfs
+        if dataset_name == "hdfs":
+            id_regex = r'(blk_-?\d+)'
+            label_dict = {}
+            blk_label_file = os.path.join(data_dir, "anomaly_label.csv")
+            blk_df = pd.read_csv(blk_label_file)
+            for _, row in tqdm(enumerate(blk_df.to_dict("records"))):
+                label_dict[row["BlockId"]] = 1 if row["Label"] == "Anomaly" else 0
 
-    # sampling with fixed window
-    # features = ["EventId", "deltaT"]
-    # target = "Label"
-    # deeplog_df = deeplog_df_transfer(df, features, target, "datetime", window_size=50)
-    # deeplog_df.dropna(subset=[target], inplace=True)
-    deeplog_df = fixed_window(df[["timestamp", "Label", "EventId", "deltaT", "EventTemplate", "Content"]],
-                                para={"window_size": int(window_size), "step_size": int(step_size)}
-                                )
+            window_df = session_window(df, id_regex, label_dict, window_size=int(window_size))
+            # window_df = shuffle(window_df).reset_index(drop=True)
+            n_train = int(len(window_df) * train_size)
+            train_window = window_df[:n_train]
+            test_window = window_df[n_train:]
+        else:
+            window_df = session_window_bgl(df)
+            n_train = int(len(window_df) * train_size)
+            train_window = window_df[:n_train]
+            test_window = window_df[n_train:]
+    else:
+        raise NotImplementedError(f"{window_type} is not implemented")
 
-    # sampling with sliding window
-    # deeplog_df = sliding_window(df[["timestamp", "Label", "EventTemplate", "deltaT"]],
-    #                             para={"window_size": int(window_size), "step_size": int(step_size)}
-    #                             )
+    if not os.path.exists(output_dir):
+        print(f"creating {output_dir}")
+        os.mkdir(output_dir)
+    # save pickle file
+    # print(train_window_df.head())
+    # print(test_window_df.head())
+    # train_window = train_window_df.to_dict("records")
+    # test_window = test_window_df.to_dict("records")
+    # with open(os.path.join(output_dir, "train.pkl"), mode="wb") as f:
+    #     pickle.dump(train_window, f)
+    # with open(os.path.join(output_dir, "test.pkl"), mode="wb") as f:
+    #     pickle.dump(test_window, f)
+    train = train_window.loc[:, ['EventTemplate', 'Label']]
+    train.rename(columns={"EventTemplate": "text", "Label": "labels"}, inplace=True)
+    train['text'] = train['text'].apply(lambda x: '|'.join(x))
+    train_normal = train[train["labels"] == 0]
+    train_normal.sample(frac=1, random_state=42)
+    train_abnormal = train[train["labels"] == 1]
+    train_sample_len = int(len(train_normal) * (1-0.1))
+    train_set = train_normal[:train_sample_len]
+
+    print("training size {}".format(len(train_set)))
+    train_set.to_csv(output_dir + "train.csv", index=False)
+    print("abnormal size {}".format(len(train_abnormal)))
     
-    #########################################################################################################
-    #                                               Version 2
-    #########################################################################################################
+    val_abnormal_len = int(0.1/0.9 * len(train_normal[train_sample_len:]))
+    validation = pd.concat([train_normal[train_sample_len:], train_abnormal[:val_abnormal_len]], axis=0)
+    validation = validation.sample(frac=1, random_state=42)
+
+    print("validation size {}".format(len(validation)))
+    print("validation anomaly {} %".format(len(validation[validation["labels"] == 1]) / len(validation) *100))
+    validation.to_csv(output_dir + "validation.csv", index=False)
+
+    test = test_window.loc[:, ['EventTemplate', 'Label']]
+    test.rename(columns={"EventTemplate": "text", "Label": "labels"}, inplace=True)
+    test['text'] = test['text'].apply(lambda x: '|'.join(x))
+
+    print("test size {}".format(len(test)))
+    test_abnormal_len = len(test[test["labels"] == 1])
+    print("test abnormal size {}".format(test_abnormal_len))
+    print("test anomaly {} %".format(test_abnormal_len / len(test) *100))
+    test.to_csv(output_dir + "test.csv", index=False)
+
+
+def _file_generator2(filename, df):
+    if "train" in filename:
+        is_duplicate = {}
+        with open(filename, 'w') as f:
+            for _, seq in enumerate(df):
+                seq = " ".join(seq)
+                if seq not in is_duplicate.keys():
+                    f.write(seq + "\n")
+                    is_duplicate[seq] = 1
+    else:
+        with open(filename, 'w') as f:
+            for _, seq in enumerate(df):
+                seq = " ".join(seq)
+                f.write(seq + "\n")
+
+
+def process_instance(data_dir, output_dir, train_file, test_file):
+    """
+    creating log sequences by sliding window
+    :param data_dir:
+    :param output_dir:
+    :param log_file:
+    :param window_size:
+    :param step_size:
+    :param train_size:
+    :return:
+    """
+    ########
+    # count anomaly
+    ########
+    # _count_anomaly(data_dir + log_file)
+
+    ##################
+    # Transformation #
+    ##################
+
+    with open(os.path.join(data_dir, train_file), mode='rb') as f:
+        train = pickle.load(f)
+
+    with open(os.path.join(data_dir, test_file), mode='rb') as f:
+        test = pickle.load(f)
+
+    train = shuffle(train)
+
+    if not os.path.exists(output_dir):
+        print(f"creating {output_dir}")
+        os.mkdir(output_dir)
+
     #########
     # Train #
     #########
-    deeplog_df.rename(columns={"EventTemplate": "text", "Label": "labels"}, inplace=True)
-    df_len = len(deeplog_df)
-    train_len = int(df_len * train_ratio)
+    train_normal = [x.src_event_ids for x in train if not x.is_anomaly]
+    # print(len(train_normal[0]))
+    _file_generator2(os.path.join(output_dir, 'train'), train_normal)
+    shutil.copyfile(os.path.join(output_dir, "train"), os.path.join(data_dir, "train"))
 
-    train = deeplog_df[:train_len]
-    train = train[train["labels"] == 0]
-    train['text'] = train['text'].apply(lambda x: '|'.join(x))
-    train = train.loc[:, ['text', 'labels']]
-    train = train.sample(frac=1)
-    train = train[:50000]
+    train_abnormal = [x.src_event_ids for x in train if x.is_anomaly]
+    _file_generator2(os.path.join(output_dir, 'train_abnormal'), train_abnormal)
+    shutil.copyfile(os.path.join(output_dir, "train_abnormal"), os.path.join(data_dir, "train_abnormal"))
 
-    print("training size {}".format(len(train)))
-    train.to_csv(output_dir + "train.csv", index=False)
+    train = [(x.src_event_ids, x.is_anomaly) for x in train]
+    train_x = [x[0] for x in train]
+    train_y = [x[1] for x in train]
 
-    # ###############
-    # #     Val     #
-    # ###############
-    # val_len = int(df_len * val_ratio)
-    # validation = deeplog_df[train_len:train_len+val_len]
-    # validation['text'] = validation['text'].apply(lambda x: '|'.join(x))
-    # validation = validation.loc[:, ['text', 'labels']]
+    with open("bgl-train.pkl", mode="wb") as f:
+        pickle.dump((train_x, train_y), f)
 
-    # print("validation size {}".format(len(validation)))
-    # print("validation anomaly {} %".format(len(validation[validation["labels"] == 1]) / len(validation) *100))
-    # validation.to_csv(output_dir + "validation.csv", index=False)
+    print("training size {}".format(len(train_normal)))
 
-    # ###############
-    # #     Test    #
-    # ###############
-    test = deeplog_df[train_len:]
-    test['text'] = test['text'].apply(lambda x: '|'.join(x))
-    test = test.loc[:, ['text', 'labels']]
-    test_normal = test[test["labels"] == 0]
-    test_normal = test_normal[:9000]
-    test_abnormal = test[test["labels"] == 1]
-    test_abnormal = test_abnormal[:1000]
-    test = pd.concat([test_normal, test_abnormal]).sample(frac=1, random_state=20)
+    ###############
+    # Test Normal #
+    ###############
+    # test_normal = df_normal[train_len:]
+    test_normal = [x.src_event_ids for x in test if not x.is_anomaly]
+    _file_generator2(os.path.join(output_dir, 'test_normal'), test_normal)
+    shutil.copyfile(os.path.join(output_dir, "test_normal"), os.path.join(data_dir, "test_normal"))
+    print("test normal size {}".format(len(test_normal)))
 
-    print("test size {}".format(len(test)))
-    print("test anomaly {} %".format(len(test[test["labels"] == 1]) / len(test) *100))
-    test.to_csv(output_dir + "test.csv", index=False)
+    # del df_normal
+    # del train
+    # del test_normal
+    # gc.collect()
 
-    ####################################################################################################################################################################
+    #################
+    # Test Abnormal #
+    #################
+    # df_abnormal = window_df[window_df["Label"] == 1]
 
-    # #########
-    # # Train #
-    # #########
-    # df_normal =deeplog_df[deeplog_df["Label"] == 0]
-    # df_abnormal =deeplog_df[deeplog_df["Label"] == 1]
-    # # df_normal = df_normal.sample(frac=1, random_state=12).reset_index(drop=True) #shuffle
-    # df_normal.rename(columns={"EventTemplate": "text", "Label": "labels"}, inplace=True)
-    # df_abnormal.rename(columns={"EventTemplate": "text", "Label": "labels"}, inplace=True)
+    test_abnormal = [x.src_event_ids for x in test if x.is_anomaly]
+    _file_generator2(os.path.join(output_dir, 'test_abnormal'), test_abnormal)
+    shutil.copyfile(os.path.join(output_dir, "test_abnormal"), os.path.join(data_dir, "test_abnormal"))
+    print('test abnormal size {}'.format(len(test_abnormal)))
+    test = [(x.src_event_ids, x.is_anomaly) for x in test]
+    test_x = [x[0] for x in test]
+    test_y = [x[1] for x in test]
 
-    # normal_len = len(df_normal)
-    # train_len = int(normal_len * train_ratio)
-    # # train_len = 10000
+    with open("bgl-test.pkl", mode="wb") as f:
+        pickle.dump((test_x, test_y), f)
 
-    # train = df_normal[:train_len]
-    # # train = train.sample(frac=.5, random_state=20) # sample normal data
-    # # deeplog_file_generator(os.path.join(output_dir,'train'), train, ["EventId", "deltaT"])
-    # train['text'] = train['text'].apply(lambda x: '|'.join(x))
-    # train = train.loc[:, ['text', 'labels']]
+def parse_log(data_dir, output_dir, log_file, parser_type,log_format, regex, keep_para=False, st=0.3, depth=3, max_child=100, tau=0.35):
+    if parser_type == "drain":
+        # the hyper parameter is set according to http://jmzhu.logpai.com/pub/pjhe_icws2017.pdf
+        # Drain is modified
+        parser = Drain.LogParser(log_format,
+                                 indir=data_dir,
+                                 outdir=output_dir,
+                                 depth=depth,
+                                 st=st,
+                                 rex=regex,
+                                 keep_para=keep_para, maxChild=max_child)
+        parser.parse(log_file)
 
-    # # deeplog_file_generator(os.path.join(output_dir,'train'), train, ["text"])
+    elif parser_type == "spell":
+        # tau = 0.35
+        parser = Spell.LogParser(indir=data_dir,
+                                 outdir=output_dir,
+                                 log_format=log_format,
+                                 tau=tau,
+                                 rex=regex,
+                                 keep_para=keep_para)
+        parser.parse(log_file)
 
-    # print("training size {}".format(len(train)))
-    # train.to_csv(output_dir + "train.csv", index=False)
-
-
-    # # # ###############
-    # # # # Test Normal #
-    # # # ###############
-    # # # test_normal = df_normal[train_len:]
-    # # # deeplog_file_generator(os.path.join(output_dir, 'test_normal'), test_normal, ["EventId"])
-    # # # print("test normal size {}".format(normal_len - train_len))
-
-    # # # del df_normal
-    # # # del train
-    # # # del test_normal
-    # # # gc.collect()
-
-    # # # #################
-    # # # # Test Abnormal #
-    # # # #################
-    # # # df_abnormal = deeplog_df[deeplog_df["Label"] == 1]
-    # # # #df_abnormal["EventId"] = df_abnormal["EventId"].progress_apply(lambda e: event_index_map[e] if event_index_map.get(e) else UNK)
-    # # # deeplog_file_generator(os.path.join(output_dir,'test_abnormal'), df_abnormal, ["EventId"])
-    # # # print('test abnormal size {}'.format(len(df_abnormal)))
-
-    # # ###############
-    # # #     Val     #
-    # # ###############
-    # val_normal = df_normal[train_len:train_len+4500]
-    # val_abnormal = df_abnormal[:500]
-    # validation = pd.concat([val_normal, val_abnormal]).sample(frac=1, random_state=20)
-
-    # validation['text'] = validation['text'].apply(lambda x: '|'.join(x))
-    # validation = validation.loc[:, ['text', 'labels']]
-
-    # print("validation size {}".format(len(validation)))
-    # validation.to_csv(output_dir + "validation.csv", index=False)
-
-    # # ###############
-    # # #     Test    #
-    # # ###############
-
-    # test_normal = df_normal[train_len+4500:train_len+9000]
-    # test_abnormal = df_abnormal[500:1000]
-    # test = pd.concat([test_normal, test_abnormal]).sample(frac=1, random_state=20)
-
-    # test['text'] = test['text'].apply(lambda x: '|'.join(x))
-    # test = test.loc[:, ['text', 'labels']]
-
-    # print("test size {}".format(len(test)))
-    # validation.to_csv(output_dir + "test.csv", index=False)
-
+if __name__ == '__main__':
+    # seed_everything()
+    # log_format = '<Label> <Id> <Date> <Code1> <Time> <Code2> <Component1> <Component2> <Level> <Content>'
+    # regex = [
+    #     r'(0x)[0-9a-fA-F]+', #hexadecimal
+    #     r'\d+.\d+.\d+.\d+',
+    #     # r'/\w+( )$'
+    #     r'\d+'
+    # ]
+    # parse_log("./", "./", "BGL.log", "drain", log_format, regex)
+    process_dataset(data_dir="./", output_dir="./", log_file="BGL.log", dataset_name="bgl",
+                    window_type="sliding", window_size=50, step_size=50, train_size=0.8, random_sample=False,
+                    session_type="entry")
