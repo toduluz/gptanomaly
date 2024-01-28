@@ -595,7 +595,7 @@ def main():
 
         return auroc
 
-    def compute_metrics_for_test(mlm_predictions, mlm_labels, labels):
+    def compute_metrics_with_f1(mlm_predictions, mlm_labels, labels):
         top_k_accuracies = []
 
         for preds, lbls in zip(mlm_predictions, mlm_labels):
@@ -627,12 +627,44 @@ def main():
         best_threshold = thresholds[ix]
 
         # Compute the F1 score, precision, and recall at the best threshold
-        predictions = [1 if acc > best_threshold else 0 for acc in top_k_accuracies]
+        predictions = [1 if acc < best_threshold else 0 for acc in top_k_accuracies]
         best_f1 = f1_score(labels, predictions)
         best_precision = precision_score(labels, predictions)
         best_recall = recall_score(labels, predictions)
 
         return {"f1": best_f1, "precision": best_precision, "recall": best_recall, "auroc": auroc, "threshold": best_threshold}
+    
+    def compute_metrics_for_test(mlm_predictions, mlm_labels, labels, threshold):
+        top_k_accuracies = []
+
+        for preds, lbls in zip(mlm_predictions, mlm_labels):
+            # Remove -100 values
+            mask = lbls != -100
+            preds = preds[mask]
+            lbls = lbls[mask]
+
+            # Check if the true labels are in the top-k predictions
+            correct = np.expand_dims(lbls, axis=-1) == preds
+
+            # Compute the top-k accuracy for the current sentence
+            top_k_accuracy = correct.any(axis=-1).mean()
+            
+            # Replace NaN values with 0
+            top_k_accuracy = np.nan_to_num(top_k_accuracy, nan=0)
+
+            top_k_accuracies.append(top_k_accuracy)
+        
+        # Compute the AUROC
+        auroc = roc_auc_score(labels, top_k_accuracies)
+
+        # Compute the F1 score, precision, and recall at the best threshold
+        predictions = [1 if acc < threshold else 0 for acc in top_k_accuracies]
+        best_f1 = f1_score(labels, predictions)
+        best_precision = precision_score(labels, predictions)
+        best_recall = recall_score(labels, predictions)
+
+        return {"f1": best_f1, "precision": best_precision, "recall": best_recall, "auroc": auroc, "threshold": threshold}
+
         
     train_dataset = tokenized_datasets["train"]
     eval_dataset = tokenized_datasets["validation"]
@@ -771,6 +803,7 @@ def main():
 
     # Initialize the highest AUROC score and the corresponding model state
     highest_auroc = 0
+    threshold = 0
     best_model_dir = None
 
     for epoch in range(starting_epoch, args.num_train_epochs):
@@ -832,11 +865,13 @@ def main():
         mlm_preds = np.concatenate(mlm_preds)
         mlm_labels = np.concatenate(mlm_labels)
         log_labels = np.concatenate(log_labels)
-        auroc = compute_metrics(mlm_preds, mlm_labels, log_labels)
+        results = compute_metrics_with_f1(mlm_preds, mlm_labels, log_labels)
         # If the current AUROC score is higher than the highest score so far
-        if auroc > highest_auroc:
+        if results["auroc"] > highest_auroc:
             # Update the highest AUROC score
-            highest_auroc = auroc
+            highest_auroc = results["auroc"]
+            # Update the corresponding threshold
+            threshold = results["threshold"]
 
             # Save the current model state
             best_model_dir = f"epoch_{epoch}"
@@ -845,13 +880,17 @@ def main():
         #     perplexity = float("inf")
 
         # logger.info(f"epoch {epoch}: perplexity: {perplexity} eval_loss: {eval_loss}")
-        logger.info(f"epoch {epoch}: eval_loss: {eval_loss} auroc: {auroc} highest_auroc: {highest_auroc}")
+        logger.info(f"epoch {epoch}: eval_loss: {eval_loss} auROC: {results['auroc']} f1: {results['f1']} precision: {results['precision']} recall: {results['recall']} threshold: {results['threshold']}")
 
         if args.with_tracking:
             accelerator.log(
                 {
                     # "perplexity": perplexity,
-                    "auroc": auroc,
+                    "auroc": results["auroc"],
+                    "f1": results["f1"],
+                    "precision": results["precision"],
+                    "recall": results["recall"],
+                    "threshold": results["threshold"],
                     "highest_auroc": highest_auroc,
                     "eval_loss": eval_loss,
                     "train_loss": total_loss.item() / len(train_dataloader),
@@ -898,7 +937,7 @@ def main():
     mlm_preds = np.concatenate(mlm_preds)
     mlm_labels = np.concatenate(mlm_labels)
     log_labels = np.concatenate(log_labels)
-    results = compute_metrics_for_test(mlm_preds, mlm_labels, log_labels)
+    results = compute_metrics_for_test(mlm_preds, mlm_labels, log_labels, threshold)
     logger.info(f"test results: {results}")
 
     if args.with_tracking:
