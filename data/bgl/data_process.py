@@ -166,9 +166,10 @@ def process_dataset(data_dir, output_dir, log_file, dataset_name, window_type, w
     #     pickle.dump(train_window, f)
     # with open(os.path.join(output_dir, "test.pkl"), mode="wb") as f:
     #     pickle.dump(test_window, f)
-    train = train_window.loc[:, ['EventTemplate', 'Label']]
+    train = train_window.loc[:, ['EventTemplate', 'Label', 'Content']]
     train.rename(columns={"EventTemplate": "text", "Label": "labels"}, inplace=True)
-    train['text'] = train['text'].apply(lambda x: '|'.join(x))
+    train['text'] = train['text'].apply(lambda x: ' '.join(x))
+    train['Content'] = train['Content'].apply(lambda x: ' '.join(x))
     train_normal = train[train["labels"] == 0]
     train_normal.sample(frac=1, random_state=42)
     train_abnormal = train[train["labels"] == 1]
@@ -331,5 +332,5 @@ if __name__ == '__main__':
     # ]
     # parse_log("./", "./", "BGL.log", "drain", log_format, regex)
     process_dataset(data_dir="./", output_dir="./", log_file="BGL.log", dataset_name="bgl",
-                    window_type="sliding", window_size=50, step_size=50, train_size=0.8, random_sample=False,
+                    window_type="sliding", window_size=20, step_size=20, train_size=0.8, random_sample=False,
                     session_type="entry")

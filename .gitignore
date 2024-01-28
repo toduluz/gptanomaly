@@ -141,8 +141,11 @@ logs/
 .log
 *.csv
 
-#PLM Folder
+# PLM Folder
 PLMs/
 
-#Outputs Folder
+# Outputs Folder
 outputs/
+
+# Model Weights
+pytorch_model.bin

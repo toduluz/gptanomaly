@@ -66,16 +66,22 @@ def hdfs_sampling(log_file, window='session'):
     #     event_num = json.load(f)
     # df["EventId"] = df["EventId"].apply(lambda x: event_num.get(x, -1))
 
-    data_dict = defaultdict(list) #preserve insertion order of items
+    # data_dict = defaultdict(list) #preserve insertion order of items
+    data_dict = defaultdict(lambda: defaultdict(list)) #preserve insertion order of items
     for idx, row in tqdm(df.iterrows()):
         blkId_list = re.findall(r'(blk_-?\d+)', row['Content'])
         blkId_set = set(blkId_list)
         for blk_Id in blkId_set:
-            data_dict[blk_Id].append(row["EventTemplate"])
+            data_dict[blk_Id]['EventTemplate'].append(row["EventTemplate"])
+            data_dict[blk_Id]['Content'].append(row["Content"])
+    
+    data_list = [(key, values['EventTemplate'], values['Content']) for key, values in data_dict.items()]
+    data_df = pd.DataFrame(data_list, columns=['BlockId', 'EventTemplate', 'Content'])
 
-    data_df = pd.DataFrame(list(data_dict.items()), columns=['BlockId', 'EventTemplate'])
+    # data_df = pd.DataFrame(list(data_dict.items()), columns=['BlockId', 'EventTemplate'])
     # Join the elements of each list into a string separated by period and a space
-    data_df['EventTemplate'] = data_df['EventTemplate'].apply(lambda lst: '|'.join(map(str, lst)))
+    data_df['EventTemplate'] = data_df['EventTemplate'].apply(lambda lst: ' '.join(map(str, lst)))
+    data_df['Content'] = data_df['Content'].apply(lambda lst: ' '.join(map(str, lst)))
 
     data_df.to_csv(log_sequence_file, index=None)
     print("hdfs sampling done")
@@ -95,11 +101,11 @@ def generate_train_test_v1(hdfs_sequence_file):
     seq.rename(columns={"EventTemplate": "text"}, inplace=True)
     # print(type(seq["text"][0]))
 
-    normal_seq = seq[seq["labels"] == 0][["text", "labels"]]
+    normal_seq = seq[seq["labels"] == 0][["text", "Content", "labels"]]
     train = normal_seq[:10000]
     train = train.sample(frac=.5, random_state=42) # sample normal data
 
-    abnormal_seq= seq[(seq["labels"] == 1)][["text", "labels"]]
+    abnormal_seq= seq[(seq["labels"] == 1)][["text", "Content", "labels"]]
 
     val_set_normal = normal_seq[10000:14500]
     val_set_abnormal = abnormal_seq[:500]
@@ -137,7 +143,7 @@ def generate_train_test(hdfs_sequence_file):
 
     # seq["text"] = [' '.join(map(str, l)) for l in seq["EventSequence"]]
     seq.rename(columns={"EventTemplate": "text"}, inplace=True)
-    seq = seq[["text", "labels"]]
+    seq = seq[["text", "labels", "Content"]]
     # print(type(seq["text"][0]))
 
     train_ratio = 0.8
@@ -193,5 +199,5 @@ if __name__ == "__main__":
     # log_format = '<Date> <Time> <Pid> <Level> <Component>: <Content>'  # HDFS log format
     # parser(input_dir, output_dir, log_file, log_format, 'drain')
     # mapping()
-    # hdfs_sampling(log_structured_file)
+    hdfs_sampling(log_structured_file)
     generate_train_test(log_sequence_file)
