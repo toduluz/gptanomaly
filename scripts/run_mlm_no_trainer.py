@@ -54,7 +54,7 @@ from transformers import (
 )
 from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score, roc_curve
 import numpy as np
 
 
@@ -489,7 +489,6 @@ def main():
             batch['secondary_input_ids'] = secondary_batch['input_ids']
             batch['secondary_attention_mask'] = secondary_batch['attention_mask']
             batch['log_labels'] = examples['labels']
-            print(batch.keys())
             return batch
 
         # def tokenize_function(examples):
@@ -595,6 +594,45 @@ def main():
         auroc = roc_auc_score(labels, top_k_accuracies)
 
         return auroc
+
+    def compute_metrics_for_test(mlm_predictions, mlm_labels, labels):
+        top_k_accuracies = []
+
+        for preds, lbls in zip(mlm_predictions, mlm_labels):
+            # Remove -100 values
+            mask = lbls != -100
+            preds = preds[mask]
+            lbls = lbls[mask]
+
+            # Check if the true labels are in the top-k predictions
+            correct = np.expand_dims(lbls, axis=-1) == preds
+
+            # Compute the top-k accuracy for the current sentence
+            top_k_accuracy = correct.any(axis=-1).mean()
+            
+            # Replace NaN values with 0
+            top_k_accuracy = np.nan_to_num(top_k_accuracy, nan=0)
+
+            top_k_accuracies.append(top_k_accuracy)
+
+        # Compute the AUROC
+        auroc = roc_auc_score(labels, top_k_accuracies)
+
+        # Compute ROC curve
+        fpr, tpr, thresholds = roc_curve(labels, top_k_accuracies)
+
+        # Get the best threshold
+        gmeans = np.sqrt(tpr * (1-fpr))
+        ix = np.argmax(gmeans)
+        best_threshold = thresholds[ix]
+
+        # Compute the F1 score, precision, and recall at the best threshold
+        predictions = [1 if acc > best_threshold else 0 for acc in top_k_accuracies]
+        best_f1 = f1_score(labels, predictions)
+        best_precision = precision_score(labels, predictions)
+        best_recall = recall_score(labels, predictions)
+
+        return {"f1": best_f1, "precision": best_precision, "recall": best_recall, "auroc": auroc, "threshold": best_threshold}
         
     train_dataset = tokenized_datasets["train"]
     eval_dataset = tokenized_datasets["validation"]
@@ -860,8 +898,8 @@ def main():
     mlm_preds = np.concatenate(mlm_preds)
     mlm_labels = np.concatenate(mlm_labels)
     log_labels = np.concatenate(log_labels)
-    auroc = compute_metrics(mlm_preds, mlm_labels, log_labels)
-    logger.info(f"test auroc: {auroc}")
+    results = compute_metrics_for_test(mlm_preds, mlm_labels, log_labels)
+    logger.info(f"test results: {results}")
 
     if args.with_tracking:
         accelerator.end_training()
@@ -879,7 +917,7 @@ def main():
 
             with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
                 # json.dump({"perplexity": perplexity}, f)
-                json.dump({"test_auroc": auroc}, f)
+                json.dump({"auroc": results["auroc"], "f1": results["f1"], "precision": results["precision"], "recall": results["recall"], "threshold": results["threshold"]}, f)
 
 
 if __name__ == "__main__":

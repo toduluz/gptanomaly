@@ -18,3 +18,4 @@ accelerate launch scripts/run_mlm_no_trainer.py \
     --max_test_samples 100 \
     --checkpointing_steps epoch \
     --preprocessing_num_workers 10 \
+    --mlm_probability 0.40 \
