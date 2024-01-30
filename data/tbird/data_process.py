@@ -84,7 +84,7 @@ def process_dataset(data_dir, output_dir, log_file, dataset_name, window_type, w
     ########
     # count anomaly
     ########
-    _count_anomaly(data_dir + log_file)
+    # _count_anomaly(data_dir + log_file)
 
     ##################
     # Transformation #
@@ -169,8 +169,8 @@ def process_dataset(data_dir, output_dir, log_file, dataset_name, window_type, w
     #     pickle.dump(train_window, f)
     # with open(os.path.join(output_dir, "test.pkl"), mode="wb") as f:
     #     pickle.dump(test_window, f)
-    train = train_window.loc[:, ['EventTemplate', 'Label', 'Content']]
-    train.rename(columns={"EventTemplate": "text", "Label": "labels"}, inplace=True)
+    train = train_window.loc[:, ['EventTemplate', 'Label', 'Seq']]
+    train.rename(columns={"EventTemplate": "text", "Label": "labels", "Seq": "Content"}, inplace=True)
     train['text'] = train['text'].apply(lambda x: ' '.join(x))
     train['Content'] = train['Content'].apply(lambda x: ' '.join(x))
     train_normal = train[train["labels"] == 0]
@@ -191,9 +191,10 @@ def process_dataset(data_dir, output_dir, log_file, dataset_name, window_type, w
     print("validation anomaly {} %".format(len(validation[validation["labels"] == 1]) / len(validation) *100))
     validation.to_csv(output_dir + "validation.csv", index=False)
 
-    test = test_window.loc[:, ['EventTemplate', 'Label']]
-    test.rename(columns={"EventTemplate": "text", "Label": "labels"}, inplace=True)
-    test['text'] = test['text'].apply(lambda x: '|'.join(x))
+    test = test_window.loc[:, ['EventTemplate', 'Label', 'Seq']]
+    test.rename(columns={"EventTemplate": "text", "Label": "labels", "Seq": "Content"}, inplace=True)
+    test['text'] = test['text'].apply(lambda x: ' '.join(x))
+    test['Content'] = test['Content'].apply(lambda x: ' '.join(x))
 
     print("test size {}".format(len(test)))
     test_abnormal_len = len(test[test["labels"] == 1])
@@ -325,18 +326,19 @@ def parse_log(data_dir, output_dir, log_file, parser_type,log_format, regex, kee
         parser.parse(log_file)
 
 if __name__ == '__main__':
-    # seed_everything()
-    # sample_size = 10 ** 7
-    # sample_step_size = 10 ** 4
-    # sample_raw_data("Thunderbird.log", "Thunderbird_10M.log", sample_size, sample_step_size)
-    # log_format = '<Label> <Id> <Date> <Admin> <Month> <Day> <Time> <AdminAddr> <Content>'
-    # regex = [
-    #     r'(0x)[0-9a-fA-F]+',  # hexadecimal
-    #     r'\d+\.\d+\.\d+\.\d+',
-    #     r'(?<=Warning: we failed to resolve data source name )[\w\s]+',
-    #     r'\d+'
-    # ]
-    # parse_log("./", "./", "Thunderbird_10M.log", "drain", log_format, regex)
-    process_dataset(data_dir="./", output_dir="./", log_file="Thunderbird_10M.log", dataset_name="tbird",
+    seed_everything()
+    sample_size = 2 * 10 ** 7
+    sample_step_size = 10 ** 4
+    input_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../.dataset/tbird'))
+    sample_raw_data(input_dir + "/" + "Thunderbird.log", input_dir + "/" + "Thunderbird_20M.log", sample_size, sample_step_size)
+    log_format = '<Label> <Id> <Date> <Admin> <Month> <Day> <Time> <AdminAddr> <Content>'
+    regex = [
+        r'(0x)[0-9a-fA-F]+',  # hexadecimal
+        r'\d+\.\d+\.\d+\.\d+',
+        r'(?<=Warning: we failed to resolve data source name )[\w\s]+',
+        r'\d+'
+    ]
+    parse_log(input_dir, "./", "Thunderbird_20M.log", "drain", log_format, regex)
+    process_dataset(data_dir="./", output_dir="./", log_file="Thunderbird_20M.log", dataset_name="tbird",
                     window_type="sliding", window_size=20, step_size=20, train_size=0.8, random_sample=False,
                     session_type="entry")
