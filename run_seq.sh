@@ -1,9 +1,9 @@
-DATASET_NAME=bgl
+DATASET_NAME=hdfs
 main_process_port=$(( $RANDOM % 10 + 29500 ))
 echo "Main process port: $main_process_port"
 # --main_process_port $main_process_port
 # STEPS=500
-accelerate launch scripts/run_mlm_no_trainer.py \
+accelerate launch scripts/run_seq_class_no_trainer.py \
     --train_file data/${DATASET_NAME}/train.csv \
     --validation_file data/${DATASET_NAME}/validation.csv \
     --test_file data/${DATASET_NAME}/test.csv \
@@ -18,7 +18,6 @@ accelerate launch scripts/run_mlm_no_trainer.py \
     --line_by_line true \
     --checkpointing_steps epoch \
     --preprocessing_num_workers 10 \
-    --mlm_probability 0.15 \
-    --max_train_samples 5000 \
-    --max_eval_samples 5000 \
-    --max_test_samples 5000 \
+    --max_train_samples 500 \
+    --max_eval_samples 500 \
+    --max_test_samples 500 \

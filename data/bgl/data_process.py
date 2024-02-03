@@ -324,15 +324,15 @@ def parse_log(data_dir, output_dir, log_file, parser_type,log_format, regex, kee
 
 if __name__ == '__main__':
     seed_everything()
-    # log_format = '<Label> <Id> <Date> <Code1> <Time> <Code2> <Component1> <Component2> <Level> <Content>'
-    # regex = [
-    #     r'(0x)[0-9a-fA-F]+', #hexadecimal
-    #     r'\d+.\d+.\d+.\d+',
-    #     # r'/\w+( )$'
-    #     r'\d+'
-    # ]
-    # input_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../.dataset/bgl'))
-    # parse_log(input_dir, "./", "BGL.log", "drain", log_format, regex)
+    log_format = '<Label> <Id> <Date> <Code1> <Time> <Code2> <Component1> <Component2> <Level> <Content>'
+    regex = [
+        r'(0x)[0-9a-fA-F]+', #hexadecimal
+        r'\d+.\d+.\d+.\d+',
+        # r'/\w+( )$'
+        r'\d+'
+    ]
+    input_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../.dataset/bgl'))
+    parse_log(input_dir, "./", "BGL.log", "drain", log_format, regex)
     process_dataset(data_dir="./", output_dir="./", log_file="BGL.log", dataset_name="bgl",
                     window_type="sliding", window_size=20, step_size=20, train_size=0.8, random_sample=False,
                     session_type="entry")

@@ -46,9 +46,9 @@ from transformers import (
     CONFIG_MAPPING,
     MODEL_MAPPING,
     AutoConfig,
-    AutoModelForMaskedLM,
+    AutoModelForSequenceClassification,
     AutoTokenizer,
-    DataCollatorForLanguageModeling,
+    DataCollatorWithPadding,
     SchedulerType,
     get_scheduler,
 )
@@ -409,7 +409,6 @@ def main():
     else:
         config = CONFIG_MAPPING[args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
-    config.num_labels = 2
     print("*" * 1000)
     if args.tokenizer_name:
         tokenizer = AutoTokenizer.from_pretrained(
@@ -426,7 +425,7 @@ def main():
         )
     print("*" * 1000)
     if args.model_name_or_path:
-        model = AutoModelForMaskedLM.from_pretrained(
+        model = AutoModelForSequenceClassification.from_pretrained(
             args.model_name_or_path,
             from_tf=bool(".ckpt" in args.model_name_or_path),
             config=config,
@@ -435,7 +434,7 @@ def main():
         )
     else:
         logger.info("Training new model from scratch")
-        model = AutoModelForMaskedLM.from_config(config, trust_remote_code=args.trust_remote_code)
+        model = AutoModelForSequenceClassification.from_config(config, trust_remote_code=args.trust_remote_code)
 
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
@@ -475,9 +474,6 @@ def main():
                 padding=padding,
                 truncation=True,
                 max_length=max_seq_length,
-                # We use this option because DataCollatorForLanguageModeling (see below) is more efficient when it
-                # receives the `special_tokens_mask`.
-                return_special_tokens_mask=True,
             )
 
             secondary_batch = tokenizer(
@@ -489,7 +485,7 @@ def main():
 
             batch['secondary_input_ids'] = secondary_batch['input_ids']
             batch['secondary_attention_mask'] = secondary_batch['attention_mask']
-            batch['log_labels'] = examples['labels']
+            batch['labels'] = examples['labels']
             return batch
 
         # def tokenize_function(examples):
@@ -564,86 +560,17 @@ def main():
                 load_from_cache_file=not args.overwrite_cache,
                 desc=f"Grouping texts in chunks of {max_seq_length}",
             )
-
-    def precompute_logits(logits, k=5):
-        # Get the top-k predictions
-        top_k_predictions = torch.topk(logits, k, dim=-1)[1]
-
-        return top_k_predictions
-
-
-    def compute_metrics_with_f1(mlm_predictions, mlm_labels, class_preds, labels):
-        top_k_accuracies = []
-
-        for preds, lbls in zip(mlm_predictions, mlm_labels):
-            # Remove -100 values
-            mask = lbls != -100
-            preds = preds[mask]
-            lbls = lbls[mask]
-
-            # Check if the true labels are in the top-k predictions
-            correct = np.expand_dims(lbls, axis=-1) == preds
-
-            # Compute the top-k accuracy for the current sentence
-            top_k_accuracy = correct.any(axis=-1).mean()
-            
-            # Replace NaN values with 0
-            top_k_accuracy = np.nan_to_num(top_k_accuracy, nan=0)
-
-            top_k_accuracies.append(top_k_accuracy)
-
-        anomaly_scores = [1 - top_k_accuracies[i] + class_preds[i][1] for i in range(len(top_k_accuracies))]
-        # Compute the AUROC
-        auroc = roc_auc_score(labels, anomaly_scores)
-
-        # Compute ROC curve
-        fpr, tpr, thresholds = roc_curve(labels, anomaly_scores)
-
-        # Get the best threshold
-        gmeans = np.sqrt(tpr * (1-fpr))
-        ix = np.argmax(gmeans)
-        best_threshold = thresholds[ix]
-        
-        # Compute the F1 score, precision, and recall at the best threshold
-        predictions = [1 if score > best_threshold else 0 for score in anomaly_scores]
-        best_f1 = f1_score(labels, predictions)
-        best_precision = precision_score(labels, predictions)
-        best_recall = recall_score(labels, predictions)
-
-        return {"f1": best_f1, "precision": best_precision, "recall": best_recall, "auroc": auroc, "threshold": best_threshold}
     
-    def compute_metrics_for_test(mlm_predictions, mlm_labels, class_preds, labels, threshold):
-        top_k_accuracies = []
-
-        for preds, lbls in zip(mlm_predictions, mlm_labels):
-            # Remove -100 values
-            mask = lbls != -100
-            preds = preds[mask]
-            lbls = lbls[mask]
-
-            # Check if the true labels are in the top-k predictions
-            correct = np.expand_dims(lbls, axis=-1) == preds
-
-            # Compute the top-k accuracy for the current sentence
-            top_k_accuracy = correct.any(axis=-1).mean()
-            
-            # Replace NaN values with 0
-            top_k_accuracy = np.nan_to_num(top_k_accuracy, nan=0)
-
-            top_k_accuracies.append(top_k_accuracy)
-        
-        anomaly_scores = [1 - top_k_accuracies[i] + class_preds[i][1] for i in range(len(top_k_accuracies))]
-            
-        # Compute the AUROC
-        auroc = roc_auc_score(labels, anomaly_scores)
-
-        # Compute the F1 score, precision, and recall at the best threshold
-        predictions = [1 if score > threshold else 0 for score in anomaly_scores]
-        best_f1 = f1_score(labels, predictions)
-        best_precision = precision_score(labels, predictions)
-        best_recall = recall_score(labels, predictions)
-
-        return {"f1": best_f1, "precision": best_precision, "recall": best_recall, "auroc": auroc, "threshold": threshold}
+    def compute_metrics(logits, labels):
+        preds = np.argmax(logits, axis=1)
+        f1 = f1_score(labels, preds)
+        precision = precision_score(labels, preds)
+        recall = recall_score(labels, preds)
+        return {
+            'precision': precision,
+            'recall': recall,
+            'f1': f1,
+        }
 
         
     train_dataset = tokenized_datasets["train"]
@@ -664,7 +591,7 @@ def main():
 
     # Data collator
     # This one will take care of randomly masking the tokens.
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm_probability=args.mlm_probability)
+    data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
     # DataLoaders creation:
     train_dataloader = DataLoader(
@@ -781,9 +708,8 @@ def main():
     # update the progress_bar if load from checkpoint
     progress_bar.update(completed_steps)
 
-    # Initialize the highest AUROC score and the corresponding model state
-    highest_auroc = 0
-    threshold = 0
+    # Initialize the F1 score and the corresponding model state
+    highest_f1 = 0
     best_model_dir = None
 
     for epoch in range(starting_epoch, args.num_train_epochs):
@@ -824,10 +750,8 @@ def main():
 
         model.eval()
         losses = []
-        mlm_preds = []
-        mlm_labels = []
-        log_labels = []
-        class_preds = []
+        logits = []
+        labels = []
         for step, batch in enumerate(eval_dataloader):
             with torch.no_grad():
                 outputs = model(**batch)
@@ -835,46 +759,37 @@ def main():
             loss = outputs.loss
             losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
 
-            mlm_preds.append(accelerator.gather(precompute_logits(outputs.logits, k=5)).cpu().numpy())
-            mlm_labels.append(accelerator.gather(batch["labels"]).cpu().numpy())
-            log_labels.append(accelerator.gather(batch["log_labels"]).cpu().numpy())
-            class_preds.append(accelerator.gather(outputs.secondary_logits).cpu().numpy())
+            logits.append(accelerator.gather(outputs.logits))
+            labels.append(accelerator.gather(batch["labels"]))
 
         losses = torch.cat(losses)
+        logits = torch.cat(logits).cpu().numpy()
+        labels = torch.cat(labels).cpu().numpy()
         # try:
         eval_loss = torch.mean(losses)
             # perplexity = math.exp(eval_loss)
-        mlm_preds = np.concatenate(mlm_preds)
-        mlm_labels = np.concatenate(mlm_labels)
-        log_labels = np.concatenate(log_labels)
-        class_preds = np.concatenate(class_preds)
-        results = compute_metrics_with_f1(mlm_preds, mlm_labels, class_preds, log_labels)
-        # If the current AUROC score is higher than the highest score so far
-        if results["auroc"] > highest_auroc:
-            # Update the highest AUROC score
-            highest_auroc = results["auroc"]
-            # Update the corresponding threshold
-            threshold = results["threshold"]
-
-            # Save the current model state
+        results = compute_metrics(logits, labels)
+        if results["f1"] > highest_f1:
+            highest_f1 = results["f1"]
             best_model_dir = f"epoch_{epoch}"
+            if args.output_dir is not None:
+                best_model_dir = os.path.join(args.output_dir, best_model_dir)
+            accelerator.save_state(best_model_dir)
 
         # except OverflowError:
         #     perplexity = float("inf")
 
         # logger.info(f"epoch {epoch}: perplexity: {perplexity} eval_loss: {eval_loss}")
-        logger.info(f"epoch {epoch}: eval_loss: {eval_loss} auROC: {results['auroc']} f1: {results['f1']} precision: {results['precision']} recall: {results['recall']} threshold: {results['threshold']}, highest_auroc: {highest_auroc}")
-
+        logger.info(f"epoch {epoch}: eval_loss: {eval_loss} f1: {results['f1']} highest_f1: {highest_f1} precision: {results['precision']} recall: {results['recall']}")
         if args.with_tracking:
             accelerator.log(
                 {
                     # "perplexity": perplexity,
-                    "auroc": results["auroc"],
                     "f1": results["f1"],
                     "precision": results["precision"],
                     "recall": results["recall"],
                     "threshold": results["threshold"],
-                    "highest_auroc": highest_auroc,
+                    "highest_f1": highest_f1,
                     "eval_loss": eval_loss,
                     "train_loss": total_loss.item() / len(train_dataloader),
                     "epoch": epoch,
@@ -906,24 +821,18 @@ def main():
     logger.info("Loading best checkpoint from: %s", os.path.join(args.output_dir, best_model_dir))
     accelerator.load_state(os.path.join(args.output_dir, best_model_dir))
 
-    mlm_preds = []
-    mlm_labels = []
-    log_labels = []
-    class_preds = []
+    logits = []
+    labels = []
     for steps, batch in enumerate(test_dataloader):
         with torch.no_grad():
             outputs = model(**batch)
 
-        mlm_preds.append(accelerator.gather(precompute_logits(outputs.logits, k=5)).cpu().numpy())
-        mlm_labels.append(accelerator.gather(batch["labels"]).cpu().numpy())
-        log_labels.append(accelerator.gather(batch["log_labels"]).cpu().numpy())
-        class_preds.append(accelerator.gather(outputs.secondary_logits).cpu().numpy())
+        logits.append(accelerator.gather(outputs.logits))
+        labels.append(accelerator.gather(batch["labels"]))
 
-    mlm_preds = np.concatenate(mlm_preds)
-    mlm_labels = np.concatenate(mlm_labels)
-    log_labels = np.concatenate(log_labels)
-    class_preds = np.concatenate(class_preds)
-    results = compute_metrics_for_test(mlm_preds, mlm_labels, class_preds, log_labels, threshold)
+    logits = torch.cat(logits).cpu().numpy()
+    labels = torch.cat(labels).cpu().numpy()
+    results = compute_metrics(logits, labels)
     logger.info(f"test results: {results}")
 
     if args.with_tracking:
@@ -942,7 +851,7 @@ def main():
 
             with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
                 # json.dump({"perplexity": perplexity}, f)
-                json.dump({"auroc": results["auroc"], "f1": results["f1"], "precision": results["precision"], "recall": results["recall"], "threshold": results["threshold"], "highest_auroc": highest_auroc}, f)
+                json.dump({"f1": results["f1"], "precision": results["precision"], "recall": results["recall"], "highest_f1": highest_f1}, f)
 
 
 if __name__ == "__main__":
