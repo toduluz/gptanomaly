@@ -46,7 +46,7 @@ from transformers import (
     CONFIG_MAPPING,
     MODEL_MAPPING,
     AutoConfig,
-    AutoModelForMaskedLM,
+    AutoModel,
     AutoTokenizer,
     DataCollatorForLanguageModeling,
     SchedulerType,
@@ -54,7 +54,7 @@ from transformers import (
 )
 from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
-from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score, roc_curve
+from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score
 import numpy as np
 
 
@@ -268,6 +268,18 @@ def parse_args():
         default=None,
         help="For debugging purposes or quicker training, truncate the number of test examples to this value if set.",
     )
+    parser.add_argument(
+        "--early_stopping_patience",
+        type=int,
+        default=None,
+        help="If passed, will stop training early when the metric monitored stops improving.",
+    )
+    parser.add_argument(
+        "--nu",
+        type=float,
+        default=0.25,
+        help="The nu parameter for the hypersphere loss.",
+    )
     args = parser.parse_args()
 
     # Sanity checks
@@ -426,7 +438,7 @@ def main():
         )
     print("*" * 1000)
     if args.model_name_or_path:
-        model = AutoModelForMaskedLM.from_pretrained(
+        model = AutoModel.from_pretrained(
             args.model_name_or_path,
             from_tf=bool(".ckpt" in args.model_name_or_path),
             config=config,
@@ -435,7 +447,7 @@ def main():
         )
     else:
         logger.info("Training new model from scratch")
-        model = AutoModelForMaskedLM.from_config(config, trust_remote_code=args.trust_remote_code)
+        model = AutoModel.from_config(config, trust_remote_code=args.trust_remote_code)
 
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
@@ -481,7 +493,7 @@ def main():
             )
 
             secondary_batch = tokenizer(
-                examples["Content"],
+                examples["EventId"],
                 padding=padding,
                 truncation=True,
                 max_length=max_seq_length,
@@ -565,57 +577,21 @@ def main():
                 desc=f"Grouping texts in chunks of {max_seq_length}",
             )
 
-    def precompute_logits(logits, k=5):
+    def precompute_logits(logits: torch.FloatTensor, k=5) -> torch.LongTensor:
         # Get the top-k predictions
         top_k_predictions = torch.topk(logits, k, dim=-1)[1]
 
         return top_k_predictions
 
-
-    def compute_metrics_with_f1(mlm_predictions, mlm_labels, class_preds, labels):
-        top_k_accuracies = []
-
-        for preds, lbls in zip(mlm_predictions, mlm_labels):
-            # Remove -100 values
-            mask = lbls != -100
-            preds = preds[mask]
-            lbls = lbls[mask]
-
-            # Check if the true labels are in the top-k predictions
-            correct = np.expand_dims(lbls, axis=-1) == preds
-
-            # Compute the top-k accuracy for the current sentence
-            top_k_accuracy = correct.any(axis=-1).mean()
-            
-            # Replace NaN values with 0
-            top_k_accuracy = np.nan_to_num(top_k_accuracy, nan=0)
-
-            top_k_accuracies.append(top_k_accuracy)
-
-        anomaly_scores = [1 - top_k_accuracies[i] + class_preds[i][1] for i in range(len(top_k_accuracies))]
-        # Compute the AUROC
-        auroc = roc_auc_score(labels, anomaly_scores)
-
-        # Compute ROC curve
-        fpr, tpr, thresholds = roc_curve(labels, anomaly_scores)
-
-        # Get the best threshold
-        gmeans = np.sqrt(tpr * (1-fpr))
-        ix = np.argmax(gmeans)
-        best_threshold = thresholds[ix]
-        
-        # Compute the F1 score, precision, and recall at the best threshold
-        predictions = [1 if score > best_threshold else 0 for score in anomaly_scores]
-        best_f1 = f1_score(labels, predictions)
-        best_precision = precision_score(labels, predictions)
-        best_recall = recall_score(labels, predictions)
-
-        return {"f1": best_f1, "precision": best_precision, "recall": best_recall, "auroc": auroc, "threshold": best_threshold}
+    def get_radius(dist: list, nu: float):
+        """Optimally solve for radius R via the (1-nu)-quantile of distances."""
+        return np.quantile(np.sqrt(dist), 1 - nu)
     
-    def compute_metrics_for_test(mlm_predictions, mlm_labels, class_preds, labels, threshold):
+    def compute_metrics_for_test(mlm_preds: np.ndarray, mlm_labels: np.ndarray, dist: np.ndarray, log_labels: np.ndarray, radius: float) -> dict:
+
         top_k_accuracies = []
 
-        for preds, lbls in zip(mlm_predictions, mlm_labels):
+        for preds, lbls in zip(mlm_preds, mlm_labels):
             # Remove -100 values
             mask = lbls != -100
             preds = preds[mask]
@@ -632,20 +608,41 @@ def main():
 
             top_k_accuracies.append(top_k_accuracy)
         
-        anomaly_scores = [1 - top_k_accuracies[i] + class_preds[i][1] for i in range(len(top_k_accuracies))]
-            
-        # Compute the AUROC
-        auroc = roc_auc_score(labels, anomaly_scores)
+        return find_best_threshold(top_k_accuracies, np.linspace(0.51, 1, 50), dist, log_labels, radius)
+    
+    def find_best_threshold(top_k_accuracies: list, accuracy_thresholds: np.ndarray, dist: np.ndarray, log_labels: np.ndarray, radius: float) -> dict:
+        best_threshold = 0
+        best_f1 = 0
+        best_precision = 0
+        best_recall = 0
+        best_roc_auc = 0
 
-        # Compute the F1 score, precision, and recall at the best threshold
-        predictions = [1 if score > threshold else 0 for score in anomaly_scores]
-        best_f1 = f1_score(labels, predictions)
-        best_precision = precision_score(labels, predictions)
-        best_recall = recall_score(labels, predictions)
+        for threshold in accuracy_thresholds:
+            # Compute the predictions
+            preds = (np.array(top_k_accuracies) < threshold) | (dist > radius)
 
-        return {"f1": best_f1, "precision": best_precision, "recall": best_recall, "auroc": auroc, "threshold": threshold}
+            # Compute the metrics
+            f1 = f1_score(log_labels, preds, zero_division=0)
+            precision = precision_score(log_labels, preds, zero_division=0)
+            recall = recall_score(log_labels, preds, zero_division=0)
+            roc_auc = roc_auc_score(log_labels, preds)
 
-        
+            # Update the best metrics
+            if f1 > best_f1:
+                best_threshold = threshold
+                best_f1 = f1
+                best_precision = precision
+                best_recall = recall
+                best_roc_auc = roc_auc
+
+        return {
+            "threshold": best_threshold,
+            "f1": best_f1,
+            "precision": best_precision,
+            "recall": best_recall,
+            "roc_auc": best_roc_auc,
+        }
+
     train_dataset = tokenized_datasets["train"]
     eval_dataset = tokenized_datasets["validation"]
     test_dataset = tokenized_datasets["test"]
@@ -781,12 +778,13 @@ def main():
     # update the progress_bar if load from checkpoint
     progress_bar.update(completed_steps)
 
-    # Initialize the highest AUROC score and the corresponding model state
-    highest_auroc = 0
-    threshold = 0
+    best_val_loss = float("inf")
     best_model_dir = None
+    epochs_no_improve = 0
 
     for epoch in range(starting_epoch, args.num_train_epochs):
+        total_dist = []
+        radius = 0
         model.train()
         if args.with_tracking:
             total_loss = 0
@@ -795,6 +793,21 @@ def main():
             active_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
         else:
             active_dataloader = train_dataloader
+        
+        print("start calculate center")
+        with torch.no_grad():
+            outputs = 0
+            total_samples = 0
+            for data_loader in [train_dataloader, eval_dataloader]:
+                for _, data in enumerate(data_loader):
+                    result = model(**data)
+                    cls_output = result.cls_logits
+
+                    outputs += accelerator.gather(torch.sum(cls_output.detach().clone(), dim=0))
+                    total_samples += cls_output.size(0)
+
+        model.center = outputs / total_samples
+
         for step, batch in enumerate(active_dataloader):
             with accelerator.accumulate(model):
                 outputs = model(**batch)
@@ -806,6 +819,8 @@ def main():
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
+
+            total_dist += accelerator.gather(outputs.dist).cpu().tolist()
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
@@ -824,10 +839,6 @@ def main():
 
         model.eval()
         losses = []
-        mlm_preds = []
-        mlm_labels = []
-        log_labels = []
-        class_preds = []
         for step, batch in enumerate(eval_dataloader):
             with torch.no_grad():
                 outputs = model(**batch)
@@ -835,46 +846,22 @@ def main():
             loss = outputs.loss
             losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
 
-            mlm_preds.append(accelerator.gather(precompute_logits(outputs.logits, k=5)).cpu().numpy())
-            mlm_labels.append(accelerator.gather(batch["labels"]).cpu().numpy())
-            log_labels.append(accelerator.gather(batch["log_labels"]).cpu().numpy())
-            class_preds.append(accelerator.gather(outputs.secondary_logits).cpu().numpy())
-
+            total_dist += accelerator.gather(outputs.dist).cpu().tolist()
+    
         losses = torch.cat(losses)
         # try:
         eval_loss = torch.mean(losses)
             # perplexity = math.exp(eval_loss)
-        mlm_preds = np.concatenate(mlm_preds)
-        mlm_labels = np.concatenate(mlm_labels)
-        log_labels = np.concatenate(log_labels)
-        class_preds = np.concatenate(class_preds)
-        results = compute_metrics_with_f1(mlm_preds, mlm_labels, class_preds, log_labels)
-        # If the current AUROC score is higher than the highest score so far
-        if results["auroc"] > highest_auroc:
-            # Update the highest AUROC score
-            highest_auroc = results["auroc"]
-            # Update the corresponding threshold
-            threshold = results["threshold"]
-
-            # Save the current model state
-            best_model_dir = f"epoch_{epoch}"
-
         # except OverflowError:
-        #     perplexity = float("inf")
+            # perplexity = float("inf")
 
         # logger.info(f"epoch {epoch}: perplexity: {perplexity} eval_loss: {eval_loss}")
-        logger.info(f"epoch {epoch}: eval_loss: {eval_loss} auROC: {results['auroc']} f1: {results['f1']} precision: {results['precision']} recall: {results['recall']} threshold: {results['threshold']}, highest_auroc: {highest_auroc}")
+        logger.info(f"epoch: {epoch} eval_loss: {eval_loss}")
 
         if args.with_tracking:
             accelerator.log(
                 {
                     # "perplexity": perplexity,
-                    "auroc": results["auroc"],
-                    "f1": results["f1"],
-                    "precision": results["precision"],
-                    "recall": results["recall"],
-                    "threshold": results["threshold"],
-                    "highest_auroc": highest_auroc,
                     "eval_loss": eval_loss,
                     "train_loss": total_loss.item() / len(train_dataloader),
                     "epoch": epoch,
@@ -883,6 +870,25 @@ def main():
                 step=completed_steps,
             )
 
+        if eval_loss < best_val_loss:
+            best_val_loss = eval_loss
+            best_model_dir = f"epoch_{epoch}"
+            radius = get_radius(total_dist, args.nu)
+
+            if accelerator.is_main_process:
+                if args.output_dir is not None:
+                    output_dir = "best_attributes.pth"
+                    output_dir = os.path.join(args.output_dir, output_dir)
+                    logger.info(f"Saving best attributes to {output_dir}")
+                    torch.save({
+                        'best_center': model.center,
+                        'best_radius': radius
+                    }, output_dir)
+
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+        
         if args.push_to_hub and epoch < args.num_train_epochs - 1:
             accelerator.wait_for_everyone()
             unwrapped_model = accelerator.unwrap_model(model)
@@ -900,31 +906,39 @@ def main():
             if args.output_dir is not None:
                 output_dir = os.path.join(args.output_dir, output_dir)
             accelerator.save_state(output_dir, safe_serialization=False)
+ 
+        if args.early_stopping_patience is not None and epochs_no_improve > args.early_stopping_patience:
+            logger.info(f"Early stopping at epoch {epoch}")
+            break
 
     model.eval()
     logger.info("*** Test ***")
     logger.info("Loading best checkpoint from: %s", os.path.join(args.output_dir, best_model_dir))
     accelerator.load_state(os.path.join(args.output_dir, best_model_dir))
+    logger.info("Loading best attributes from: %s", os.path.join(args.output_dir, "best_attributes.pth"))
+    best_attributes = torch.load(os.path.join(args.output_dir, "best_attributes.pth"))
+    model.center = best_attributes['best_center']
+    radius = best_attributes['best_radius']
 
     mlm_preds = []
     mlm_labels = []
     log_labels = []
-    class_preds = []
+    dist = []
     for steps, batch in enumerate(test_dataloader):
         with torch.no_grad():
             outputs = model(**batch)
 
-        mlm_preds.append(accelerator.gather(precompute_logits(outputs.logits, k=5)).cpu().numpy())
+        mlm_preds.append(accelerator.gather(precompute_logits(outputs.mlm_logits, k=5)).cpu().numpy())
         mlm_labels.append(accelerator.gather(batch["labels"]).cpu().numpy())
         log_labels.append(accelerator.gather(batch["log_labels"]).cpu().numpy())
-        class_preds.append(accelerator.gather(outputs.secondary_logits).cpu().numpy())
+        dist.append(accelerator.gather(outputs.dist).cpu().numpy())
 
     mlm_preds = np.concatenate(mlm_preds)
     mlm_labels = np.concatenate(mlm_labels)
     log_labels = np.concatenate(log_labels)
-    class_preds = np.concatenate(class_preds)
-    results = compute_metrics_for_test(mlm_preds, mlm_labels, class_preds, log_labels, threshold)
-    logger.info(f"test results: {results}")
+    dist = np.concatenate(dist)
+    results = compute_metrics_for_test(mlm_preds, mlm_labels, dist, log_labels, radius)
+    logger.info(f"{results}")
 
     if args.with_tracking:
         accelerator.end_training()
@@ -942,7 +956,7 @@ def main():
 
             with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
                 # json.dump({"perplexity": perplexity}, f)
-                json.dump({"auroc": results["auroc"], "f1": results["f1"], "precision": results["precision"], "recall": results["recall"], "threshold": results["threshold"], "highest_auroc": highest_auroc}, f)
+                json.dump(results, f)
 
 
 if __name__ == "__main__":

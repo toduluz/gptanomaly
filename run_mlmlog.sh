@@ -2,7 +2,7 @@ DATASET_NAME=bgl
 main_process_port=$(( $RANDOM % 10 + 29500 ))
 echo "Main process port: $main_process_port"
 # --main_process_port $main_process_port
-# STEPS=500
+NUM_SAMPLES=1000
 accelerate launch scripts/run_mlm_no_trainer.py \
     --train_file data/${DATASET_NAME}/train.csv \
     --validation_file data/${DATASET_NAME}/validation.csv \
@@ -19,6 +19,6 @@ accelerate launch scripts/run_mlm_no_trainer.py \
     --checkpointing_steps epoch \
     --preprocessing_num_workers 10 \
     --mlm_probability 0.15 \
-    --max_train_samples 5000 \
-    --max_eval_samples 5000 \
-    --max_test_samples 5000 \
+    --max_train_samples ${NUM_SAMPLES} \
+    --max_eval_samples ${NUM_SAMPLES} \
+    --max_test_samples ${NUM_SAMPLES} \

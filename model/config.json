@@ -1,7 +1,6 @@
 {
   "auto_map": {
-    "AutoModelForMaskedLM": "model.LogRobertaModelForMaskedLM",
-    "AutoModelForSequenceClassification": "model.LogRobertaModelForSequenceClassification",
+    "AutoModel": "model.LogAnomalyRobertaModel",
     "AutoConfig": "model.LogRobertaConfig"
   },
   "attention_probs_dropout_prob": 0.1,
