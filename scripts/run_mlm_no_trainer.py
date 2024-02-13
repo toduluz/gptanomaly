@@ -816,8 +816,6 @@ def main():
         center = outputs / total_samples
         unwrapped_model = accelerator.unwrap_model(model)
         unwrapped_model.center = center
-        model = accelerator.prepare(unwrapped_model)
-        print("end calculate center")
 
         for step, batch in enumerate(active_dataloader):
             with accelerator.accumulate(model):
@@ -920,10 +918,7 @@ def main():
         
         if accelerator.is_main_process:
             # Get a list of all directories in the parent directory
-            all_dirs = [str(path) for path in Path(args.output_dir).iterdir() if path.is_dir()]
-
-            # Exclude the best directory from the list
-            all_dirs_exclude_best = [dir for dir in all_dirs if os.path.basename(dir) != best_model_dir]
+            all_dirs_exclude_best = [str(pth) for pth in Path(args.output_dir).iterdir() if pth.is_dir() and os.path.basename(pth) != best_model_dir]
 
             # Sort the directories by modification time (latest first)
             all_dirs_exclude_best.sort(key=os.path.getmtime, reverse=True)
@@ -932,7 +927,7 @@ def main():
                 dirs_to_keep = all_dirs_exclude_best[:args.max_save_limit-1]
 
                 # Loop through all directories and remove them if they are not in the list of directories to keep
-                for dir in all_dirs:
+                for dir in all_dirs_exclude_best:
                     if dir not in dirs_to_keep:
                         shutil.rmtree(dir)
         
@@ -947,7 +942,6 @@ def main():
     best_attributes = torch.load(os.path.join(args.output_dir, "best_attributes.pth"))
     unwrapped_model = accelerator.unwrap_model(model)
     unwrapped_model.center = best_attributes['best_center']
-    model = accelerator.prepare(unwrapped_model)
     radius = best_attributes['best_radius']
     model.eval()
 

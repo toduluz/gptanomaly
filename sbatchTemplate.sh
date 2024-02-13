@@ -8,9 +8,9 @@
 #################################################
 
 #SBATCH --nodes=1                   # How many nodes required? Usually 1
-#SBATCH --cpus-per-task=20           # Number of CPU to request for the job
+#SBATCH --cpus-per-task=10           # Number of CPU to request for the job
 #SBATCH --mem=64GB                   # How much memory does your job require?
-#SBATCH --gres=gpu:4                # Do you require GPUS? If not delete this line
+#SBATCH --gres=gpu:1                # Do you require GPUS? If not delete this line
 #SBATCH --time=05-00:00:00          # How long to run the job for? Jobs exceed this time will be terminated
                                     # Format <DD-HH:MM:SS> eg. 5 days 05-00:00:00
                                     # Format <DD-HH:MM:SS> eg. 24 hours 1-00:00:00 or 24:00:00
@@ -23,9 +23,9 @@
 ## EDIT AFTER THIS LINE IF YOU ARE OKAY WITH DEFAULT SETTINGS ##
 ################################################################
 
-#SBATCH --partition=dgxv100                 # The partition you've been assigned
+#SBATCH --partition=researchlong                 # The partition you've been assigned
 #SBATCH --account=guansongresearch   # The account you've been assigned (normally student)
-#SBATCH --qos=dgxv100-access       # What is the QOS assigned to you? Check with myinfo command
+#SBATCH --qos=research-1-qos       # What is the QOS assigned to you? Check with myinfo command
 #SBATCH --mail-user=yingfu.lim.2022@msc.smu.edu.sg # Who should receive the email notifications
 #SBATCH --job-name=roberta_log_anomaly     # Give the job a name
 #SBATCH --requeue
@@ -55,4 +55,4 @@ srun whichgpu
 # pip3 install -r requirements.txt
 
 # Submit your job to the cluster
-srun --gres=gpu:4 bash run_mlmlog.sh
+srun --gres=gpu:1 bash run_mlmlog.sh
