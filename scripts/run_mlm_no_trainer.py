@@ -30,6 +30,7 @@ import os
 import random
 from itertools import chain
 from pathlib import Path
+import shutil
 
 import datasets
 import torch
@@ -279,6 +280,12 @@ def parse_args():
         type=float,
         default=0.25,
         help="The nu parameter for the hypersphere loss.",
+    )
+    parser.add_argument(
+        "--max_save_limit",
+        type=int,
+        default=3,
+        help="The maximimum save limit of checkpoint",
     )
     args = parser.parse_args()
 
@@ -803,10 +810,14 @@ def main():
                     result = model(**data)
                     cls_output = result.cls_logits
 
-                    outputs += accelerator.gather(torch.sum(cls_output.detach().clone(), dim=0))
+                    outputs += torch.sum(accelerator.gather(cls_output.detach().clone()), dim=0)
                     total_samples += cls_output.size(0)
 
-        model.center = outputs / total_samples
+        center = outputs / total_samples
+        unwrapped_model = accelerator.unwrap_model(model)
+        unwrapped_model.center = center
+        model = accelerator.prepare(unwrapped_model)
+        print("end calculate center")
 
         for step, batch in enumerate(active_dataloader):
             with accelerator.accumulate(model):
@@ -881,7 +892,7 @@ def main():
                     output_dir = os.path.join(args.output_dir, output_dir)
                     logger.info(f"Saving best attributes to {output_dir}")
                     torch.save({
-                        'best_center': model.center,
+                        'best_center': center,
                         'best_radius': radius
                     }, output_dir)
 
@@ -906,19 +917,39 @@ def main():
             if args.output_dir is not None:
                 output_dir = os.path.join(args.output_dir, output_dir)
             accelerator.save_state(output_dir, safe_serialization=False)
- 
+        
+        if accelerator.is_main_process:
+            # Get a list of all directories in the parent directory
+            all_dirs = [str(path) for path in Path(args.output_dir).iterdir() if path.is_dir()]
+
+            # Exclude the best directory from the list
+            all_dirs_exclude_best = [dir for dir in all_dirs if os.path.basename(dir) != best_model_dir]
+
+            # Sort the directories by modification time (latest first)
+            all_dirs_exclude_best.sort(key=os.path.getmtime, reverse=True)
+
+            if len(all_dirs_exclude_best) > args.max_save_limit-1:
+                dirs_to_keep = all_dirs_exclude_best[:args.max_save_limit-1]
+
+                # Loop through all directories and remove them if they are not in the list of directories to keep
+                for dir in all_dirs:
+                    if dir not in dirs_to_keep:
+                        shutil.rmtree(dir)
+        
         if args.early_stopping_patience is not None and epochs_no_improve > args.early_stopping_patience:
             logger.info(f"Early stopping at epoch {epoch}")
             break
 
-    model.eval()
     logger.info("*** Test ***")
     logger.info("Loading best checkpoint from: %s", os.path.join(args.output_dir, best_model_dir))
     accelerator.load_state(os.path.join(args.output_dir, best_model_dir))
     logger.info("Loading best attributes from: %s", os.path.join(args.output_dir, "best_attributes.pth"))
     best_attributes = torch.load(os.path.join(args.output_dir, "best_attributes.pth"))
-    model.center = best_attributes['best_center']
+    unwrapped_model = accelerator.unwrap_model(model)
+    unwrapped_model.center = best_attributes['best_center']
+    model = accelerator.prepare(unwrapped_model)
     radius = best_attributes['best_radius']
+    model.eval()
 
     mlm_preds = []
     mlm_labels = []

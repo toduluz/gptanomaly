@@ -327,18 +327,18 @@ def parse_log(data_dir, output_dir, log_file, parser_type,log_format, regex, kee
 
 if __name__ == '__main__':
     seed_everything()
-    sample_size = 2 * 10 ** 7
-    sample_step_size = 10 ** 4
-    input_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../.dataset/tbird'))
-    sample_raw_data(input_dir + "/" + "Thunderbird.log", input_dir + "/" + "Thunderbird_20M.log", sample_size, sample_step_size)
-    log_format = '<Label> <Id> <Date> <Admin> <Month> <Day> <Time> <AdminAddr> <Content>'
-    regex = [
-        r'(0x)[0-9a-fA-F]+',  # hexadecimal
-        r'\d+\.\d+\.\d+\.\d+',
-        r'(?<=Warning: we failed to resolve data source name )[\w\s]+',
-        r'\d+'
-    ]
-    parse_log(input_dir, "./", "Thunderbird_20M.log", "drain", log_format, regex)
+    # sample_size = 2 * 10 ** 7
+    # sample_step_size = 10 ** 4
+    # input_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../.dataset/tbird'))
+    # sample_raw_data(input_dir + "/" + "Thunderbird.log", input_dir + "/" + "Thunderbird_20M.log", sample_size, sample_step_size)
+    # log_format = '<Label> <Id> <Date> <Admin> <Month> <Day> <Time> <AdminAddr> <Content>'
+    # regex = [
+    #     r'(0x)[0-9a-fA-F]+',  # hexadecimal
+    #     r'\d+\.\d+\.\d+\.\d+',
+    #     r'(?<=Warning: we failed to resolve data source name )[\w\s]+',
+    #     r'\d+'
+    # ]
+    # parse_log(input_dir, "./", "Thunderbird_20M.log", "drain", log_format, regex)
     process_dataset(data_dir="./", output_dir="./", log_file="Thunderbird_20M.log", dataset_name="tbird",
                     window_type="sliding", window_size=20, step_size=20, train_size=0.8, random_sample=False,
                     session_type="entry")
