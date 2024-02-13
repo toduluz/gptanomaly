@@ -285,7 +285,7 @@ def parse_args():
         "--max_save_limit",
         type=int,
         default=3,
-        help="The maximimum save limit of checkpoint",
+        help="The maximum number of models to keep in the output directory.",
     )
     args = parser.parse_args()
 
