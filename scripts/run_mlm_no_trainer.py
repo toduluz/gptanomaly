@@ -50,6 +50,7 @@ from transformers import (
     AutoModel,
     AutoTokenizer,
     DataCollatorForLanguageModeling,
+    DataCollatorWithPadding,
     SchedulerType,
     get_scheduler,
 )
@@ -496,18 +497,18 @@ def main():
                 max_length=max_seq_length,
                 # We use this option because DataCollatorForLanguageModeling (see below) is more efficient when it
                 # receives the `special_tokens_mask`.
-                return_special_tokens_mask=True,
+                return_special_tokens_mask=False,
             )
 
-            secondary_batch = tokenizer(
-                examples["EventId"],
-                padding=padding,
-                truncation=True,
-                max_length=max_seq_length,
-            )
+            # secondary_batch = tokenizer(
+            #     examples["EventId"],
+            #     padding=padding,
+            #     truncation=True,
+            #     max_length=max_seq_length,
+            # )
 
-            batch['secondary_input_ids'] = secondary_batch['input_ids']
-            batch['secondary_attention_mask'] = secondary_batch['attention_mask']
+            # batch['secondary_input_ids'] = secondary_batch['input_ids']
+            # batch['secondary_attention_mask'] = secondary_batch['attention_mask']
             batch['log_labels'] = examples['labels']
             return batch
 
@@ -594,7 +595,7 @@ def main():
         """Optimally solve for radius R via the (1-nu)-quantile of distances."""
         return np.quantile(np.sqrt(dist), 1 - nu)
     
-    def compute_metrics_for_test(mlm_preds: np.ndarray, mlm_labels: np.ndarray, dist: np.ndarray, log_labels: np.ndarray, radius: float) -> dict:
+    def compute_metrics_for_test(mlm_preds: np.ndarray, mlm_labels: np.ndarray, log_labels: np.ndarray) -> dict:
 
         top_k_accuracies = []
 
@@ -615,18 +616,64 @@ def main():
 
             top_k_accuracies.append(top_k_accuracy)
         
-        return find_best_threshold(top_k_accuracies, np.linspace(0.51, 1, 50), dist, log_labels, radius)
+        return find_best_threshold(top_k_accuracies, np.linspace(0.51, 1.0), log_labels)
     
-    def find_best_threshold(top_k_accuracies: list, accuracy_thresholds: np.ndarray, dist: np.ndarray, log_labels: np.ndarray, radius: float) -> dict:
+    def find_best_threshold(top_k_accuracies: list, accuracy_thresholds: np.ndarray, log_labels: np.ndarray) -> dict:
         best_threshold = 0
         best_f1 = 0
         best_precision = 0
         best_recall = 0
         best_roc_auc = 0
+        used = 2
 
+        map_of_include = {
+            0: "both",
+            1: "radius",
+            2: "topk"
+        }
+
+        # for include in range(3):
+        #     if include == 0:
+        #         for threshold in accuracy_thresholds:
+        #             # Compute the predictions
+        #             preds = (np.array(top_k_accuracies) < threshold) | (dist > radius)
+
+        #             # Compute the metrics
+        #             f1 = f1_score(log_labels, preds, zero_division=0)
+        #             precision = precision_score(log_labels, preds, zero_division=0)
+        #             recall = recall_score(log_labels, preds, zero_division=0)
+        #             roc_auc = roc_auc_score(log_labels, preds)
+
+        #             # Update the best metrics
+        #             if f1 > best_f1:
+        #                 best_threshold = threshold
+        #                 best_f1 = f1
+        #                 best_precision = precision
+        #                 best_recall = recall
+        #                 best_roc_auc = roc_auc
+        #                 used = include
+        #     elif include == 1:
+                # Compute the predictions
+        # preds = (dist > radius)
+
+        # # Compute the metrics
+        # f1 = f1_score(log_labels, preds, zero_division=0)
+        # precision = precision_score(log_labels, preds, zero_division=0)
+        # recall = recall_score(log_labels, preds, zero_division=0)
+        # roc_auc = roc_auc_score(log_labels, preds)
+
+        # # Update the best metrics
+        # if f1 > best_f1:
+        #     best_threshold = "none"
+        #     best_f1 = f1
+        #     best_precision = precision
+        #     best_recall = recall
+        #     best_roc_auc = roc_auc
+            # used = include
+            # else:
         for threshold in accuracy_thresholds:
             # Compute the predictions
-            preds = (np.array(top_k_accuracies) < threshold) | (dist > radius)
+            preds = (np.array(top_k_accuracies) < threshold)
 
             # Compute the metrics
             f1 = f1_score(log_labels, preds, zero_division=0)
@@ -641,6 +688,7 @@ def main():
                 best_precision = precision
                 best_recall = recall
                 best_roc_auc = roc_auc
+                # used = include
 
         return {
             "threshold": best_threshold,
@@ -648,6 +696,7 @@ def main():
             "precision": best_precision,
             "recall": best_recall,
             "roc_auc": best_roc_auc,
+            "include": map_of_include[used] if used in map_of_include else "none"
         }
 
     train_dataset = tokenized_datasets["train"]
@@ -668,7 +717,7 @@ def main():
 
     # Data collator
     # This one will take care of randomly masking the tokens.
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm_probability=args.mlm_probability)
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=args.mlm_probability)
 
     # DataLoaders creation:
     train_dataloader = DataLoader(
@@ -694,7 +743,7 @@ def main():
 
     # Note -> the training dataloader needs to be prepared before we grab his length below (cause its length will be
     # shorter in multiprocess)
-
+    print(len(train_dataloader))
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -717,7 +766,7 @@ def main():
     # On TPU, the tie weights in our model have been disconnected, so we need to restore the ties.
     if accelerator.distributed_type == DistributedType.TPU:
         model.tie_weights()
-
+    print(len(train_dataloader))
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
@@ -790,8 +839,8 @@ def main():
     epochs_no_improve = 0
 
     for epoch in range(starting_epoch, args.num_train_epochs):
-        total_dist = []
-        radius = 0
+        # total_dist = []
+        # radius = 0
         model.train()
         if args.with_tracking:
             total_loss = 0
@@ -801,21 +850,20 @@ def main():
         else:
             active_dataloader = train_dataloader
         
-        print("start calculate center")
-        with torch.no_grad():
-            outputs = 0
-            total_samples = 0
-            for data_loader in [train_dataloader, eval_dataloader]:
-                for _, data in enumerate(data_loader):
-                    result = model(**data)
-                    cls_output = result.cls_logits
+        # print("start calculate center")
+        # with torch.no_grad():
+        #     outputs = 0
+        #     total_samples = 0
+        #     for data_loader in [train_dataloader, eval_dataloader]:
+        #         for _, data in enumerate(data_loader):
+        #             result = model(**data)
+        #             cls_output = result.cls_logits
 
-                    outputs += torch.sum(accelerator.gather(cls_output.detach().clone()), dim=0)
-                    total_samples += cls_output.size(0)
+        #             outputs += torch.sum(accelerator.gather(cls_output.detach().clone()), dim=0)
+        #             total_samples += cls_output.size(0)
 
-        center = outputs / total_samples
-        unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.center = center
+        # center = outputs / total_samples
+        # model.module.center = center
 
         for step, batch in enumerate(active_dataloader):
             with accelerator.accumulate(model):
@@ -829,7 +877,7 @@ def main():
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
-            total_dist += accelerator.gather(outputs.dist).cpu().tolist()
+            # total_dist += accelerator.gather(outputs.dist).cpu().tolist()
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
@@ -855,7 +903,7 @@ def main():
             loss = outputs.loss
             losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
 
-            total_dist += accelerator.gather(outputs.dist).cpu().tolist()
+            # total_dist += accelerator.gather(outputs.dist).cpu().tolist()
     
         losses = torch.cat(losses)
         # try:
@@ -882,17 +930,17 @@ def main():
         if eval_loss < best_val_loss:
             best_val_loss = eval_loss
             best_model_dir = f"epoch_{epoch}"
-            radius = get_radius(total_dist, args.nu)
+            # radius = get_radius(total_dist, args.nu)
 
-            if accelerator.is_main_process:
-                if args.output_dir is not None:
-                    output_dir = "best_attributes.pth"
-                    output_dir = os.path.join(args.output_dir, output_dir)
-                    logger.info(f"Saving best attributes to {output_dir}")
-                    torch.save({
-                        'best_center': center,
-                        'best_radius': radius
-                    }, output_dir)
+            # if accelerator.is_main_process:
+            #     if args.output_dir is not None:
+            #         output_dir = "best_attributes.pth"
+            #         output_dir = os.path.join(args.output_dir, output_dir)
+            #         logger.info(f"Saving best attributes to {output_dir}")
+            #         torch.save({
+            #             'best_center': center,
+            #             'best_radius': radius
+            #         }, output_dir)
 
             epochs_no_improve = 0
         else:
@@ -935,20 +983,24 @@ def main():
             logger.info(f"Early stopping at epoch {epoch}")
             break
 
+    accelerator.wait_for_everyone()
     logger.info("*** Test ***")
     logger.info("Loading best checkpoint from: %s", os.path.join(args.output_dir, best_model_dir))
     accelerator.load_state(os.path.join(args.output_dir, best_model_dir))
-    logger.info("Loading best attributes from: %s", os.path.join(args.output_dir, "best_attributes.pth"))
-    best_attributes = torch.load(os.path.join(args.output_dir, "best_attributes.pth"))
-    unwrapped_model = accelerator.unwrap_model(model)
-    unwrapped_model.center = best_attributes['best_center']
-    radius = best_attributes['best_radius']
+    # logger.info("Loading best attributes from: %s", os.path.join(args.output_dir, "best_attributes.pth"))
+    # rank = accelerator.process_index
+    # map_location = {'cuda:%d' % 0: 'cuda:%d' % rank}
+    # best_attributes = torch.load(os.path.join(args.output_dir, "best_attributes.pth"), map_location=map_location)
+    # radius = best_attributes['best_radius']
+    # center = best_attributes['best_center']
+    # model.module.center = center
     model.eval()
+    # accelerator.wait_for_everyone()
 
     mlm_preds = []
     mlm_labels = []
     log_labels = []
-    dist = []
+    # dist = []
     for steps, batch in enumerate(test_dataloader):
         with torch.no_grad():
             outputs = model(**batch)
@@ -956,13 +1008,13 @@ def main():
         mlm_preds.append(accelerator.gather(precompute_logits(outputs.mlm_logits, k=5)).cpu().numpy())
         mlm_labels.append(accelerator.gather(batch["labels"]).cpu().numpy())
         log_labels.append(accelerator.gather(batch["log_labels"]).cpu().numpy())
-        dist.append(accelerator.gather(outputs.dist).cpu().numpy())
+        # dist.append(accelerator.gather(outputs.dist).cpu().numpy())
 
     mlm_preds = np.concatenate(mlm_preds)
     mlm_labels = np.concatenate(mlm_labels)
     log_labels = np.concatenate(log_labels)
-    dist = np.concatenate(dist)
-    results = compute_metrics_for_test(mlm_preds, mlm_labels, dist, log_labels, radius)
+    # dist = np.concatenate(dist)
+    results = compute_metrics_for_test(mlm_preds, mlm_labels, log_labels)
     logger.info(f"{results}")
 
     if args.with_tracking:

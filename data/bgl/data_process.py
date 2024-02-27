@@ -180,18 +180,21 @@ def process_dataset(data_dir, output_dir, log_file, dataset_name, window_type, w
     train_set.to_csv(output_dir + "train.csv", index=False)
     print("abnormal size {}".format(len(train_abnormal)))
     
-    val_abnormal_len = int(0.1/0.9 * len(train_normal[train_sample_len:]))
-    validation = pd.concat([train_normal[train_sample_len:], train_abnormal[:val_abnormal_len]], axis=0)
-    validation = validation.sample(frac=1, random_state=42)
+    # val_abnormal_len = int(0.1/0.9 * len(train_normal[train_sample_len:]))
+    # validation = pd.concat([train_normal[train_sample_len:], train_abnormal[:val_abnormal_len]], axis=0)
+    # validation = validation.sample(frac=1, random_state=42)
+    validation = train_normal[train_sample_len:]
 
     print("validation size {}".format(len(validation)))
-    print("validation anomaly {} %".format(len(validation[validation["labels"] == 1]) / len(validation) *100))
+    # print("validation anomaly {} %".format(len(validation[validation["labels"] == 1]) / len(validation) *100))
     validation.to_csv(output_dir + "validation.csv", index=False)
 
     test = test_window.loc[:, ['EventTemplate', 'Label', 'EventId']]
     test.rename(columns={"EventTemplate": "text", "Label": "labels"}, inplace=True)
     test['text'] = test['text'].apply(lambda x: ', '.join(x))
     test['EventId'] = test['EventId'].apply(lambda x: ', '.join(x))
+    # test =  pd.concat([test, train_abnormal], axis=0)
+    test = test.sample(frac=1, random_state=42)
 
     print("test size {}".format(len(test)))
     test_abnormal_len = len(test[test["labels"] == 1])
@@ -331,7 +334,7 @@ if __name__ == '__main__':
     #     # r'/\w+( )$'
     #     r'\d+'
     # ]
-    # input_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../.dataset/bgl'))
+    # input_dir = os.path.expanduser("~/.dataset/bgl")
     # parse_log(input_dir, "./", "BGL.log", "drain", log_format, regex)
     process_dataset(data_dir="./", output_dir="./", log_file="BGL.log", dataset_name="bgl",
                     window_type="sliding", window_size=20, step_size=20, train_size=0.8, random_sample=False,

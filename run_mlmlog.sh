@@ -1,4 +1,4 @@
-DATASET_NAME=hdfs
+DATASET_NAME=bgl
 main_process_port=$(( $RANDOM % 10 + 29500 ))
 echo "Main process port: $main_process_port"
 
@@ -8,9 +8,9 @@ accelerate launch --main_process_port $main_process_port scripts/run_mlm_no_trai
     --train_file data/${DATASET_NAME}/train.csv \
     --validation_file data/${DATASET_NAME}/validation.csv \
     --test_file data/${DATASET_NAME}/test.csv \
-    --per_device_train_batch_size 4 \
-    --per_device_eval_batch_size 4 \
-    --num_train_epochs 20 \
+    --per_device_train_batch_size 8 \
+    --per_device_eval_batch_size 8 \
+    --num_train_epochs 100 \
     --output_dir outputs/${DATASET_NAME} \
     --model_name_or_path ./model \
     --trust_remote_code true \
@@ -21,6 +21,6 @@ accelerate launch --main_process_port $main_process_port scripts/run_mlm_no_trai
     --preprocessing_num_workers 10 \
     --mlm_probability 0.15 \
     --early_stopping_patience 5 \
-    --max_train_samples ${NUM_SAMPLES} \
-    --max_eval_samples ${NUM_SAMPLES} \
-    --max_test_samples ${NUM_SAMPLES} \
+    # --max_train_samples ${NUM_SAMPLES} \
+    # --max_eval_samples ${NUM_SAMPLES} \
+    # --max_test_samples ${NUM_SAMPLES} \

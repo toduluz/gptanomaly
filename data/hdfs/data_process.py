@@ -50,7 +50,7 @@ def parser(input_dir, output_dir, log_file, log_format, type='drain'):
         ]
         # the hyper parameter is set according to http://jmzhu.logpai.com/pub/pjhe_icws2017.pdf
         st = 0.5  # Similarity threshold
-        depth = 3  # Depth of all leaf nodes
+        depth = 5  # Depth of all leaf nodes
 
 
         parser = Drain.LogParser(log_format, indir=input_dir, outdir=output_dir, depth=depth, st=st, rex=regex, keep_para=False)
@@ -80,57 +80,13 @@ def hdfs_sampling(log_file, window='session'):
     data_df = pd.DataFrame(data_list, columns=['BlockId', 'EventTemplate', 'EventId'])
 
     # data_df = pd.DataFrame(list(data_dict.items()), columns=['BlockId', 'EventTemplate'])
-    # Join the elements of each list into a string separated by period and a space
+
+    # Join the elements of each list into a string separated by comma and a space
     data_df['EventTemplate'] = data_df['EventTemplate'].apply(lambda lst: ', '.join(map(str, lst)))
     data_df['EventId'] = data_df['EventId'].apply(lambda lst: ', '.join(map(str, lst)))
 
     data_df.to_csv(log_sequence_file, index=None)
     print("hdfs sampling done")
-
-
-def generate_train_test_v1(hdfs_sequence_file):
-    blk_label_dict = {}
-    blk_label_file = os.path.join(input_dir, "anomaly_label.csv")
-    blk_df = pd.read_csv(blk_label_file)
-    for _ , row in tqdm(blk_df.iterrows()):
-        blk_label_dict[row["BlockId"]] = 1 if row["Label"] == "Anomaly" else 0
-
-    seq = pd.read_csv(hdfs_sequence_file)
-    seq["labels"] = seq["BlockId"].apply(lambda x: blk_label_dict.get(x)) #add label to the sequence of each blockid
-
-    # seq["text"] = [' '.join(map(str, l)) for l in seq["EventSequence"]]
-    seq.rename(columns={"EventTemplate": "text"}, inplace=True)
-    # print(type(seq["text"][0]))
-
-    normal_seq = seq[seq["labels"] == 0][["text", "EventId", "labels"]]
-    train = normal_seq[:10000]
-    train = train.sample(frac=.5, random_state=42) # sample normal data
-
-    abnormal_seq= seq[(seq["labels"] == 1)][["text", "EventId", "labels"]]
-
-    val_set_normal = normal_seq[10000:14500]
-    val_set_abnormal = abnormal_seq[:500]
-    test_set_normal = normal_seq[14500:19000]
-    test_set_abnormal = abnormal_seq[500:1000]
-
-    validation = pd.concat([val_set_normal, val_set_abnormal]).sample(frac=1, random_state=42)
-    test = pd.concat([test_set_normal, test_set_abnormal]).sample(frac=1, random_state=42)
-
-    # train.rename(columns={"EventSequence":"text", "Label":"labels"}, inplace=True)
-    # validation.rename(columns={"EventSequence":"text", "Label":"labels"}, inplace=True)
-    # test.rename(columns={"EventSequence":"text", "Label":"labels"}, inplace=True)
-    # train.sort_index(inplace=True)
-
-    train_len = len(train)
-    val_len = len(validation)
-    test_len = len(test)
-   
-    print("train size {0}, validation size {1}, test size {2}".format(train_len, val_len, test_len))
-
-    train.to_csv(output_dir + "train.csv", index=False)
-    validation.to_csv(output_dir + "validation.csv", index=False)
-    test.to_csv(output_dir + "test.csv", index=False)
-    print("generate train validation test data done")
 
 def generate_train_test(hdfs_sequence_file):
     blk_label_dict = {}
@@ -142,45 +98,38 @@ def generate_train_test(hdfs_sequence_file):
     seq = pd.read_csv(hdfs_sequence_file)
     seq["labels"] = seq["BlockId"].apply(lambda x: blk_label_dict.get(x)) #add label to the sequence of each blockid
 
-    # seq["text"] = [' '.join(map(str, l)) for l in seq["EventSequence"]]
     seq.rename(columns={"EventTemplate": "text"}, inplace=True)
     seq = seq[["text", "labels", "EventId"]]
-    # print(type(seq["text"][0]))
 
     train_ratio = 0.8
     val_ratio = 0.1
 
     seq_len = len(seq)
     train_len = int(seq_len * train_ratio)
-    # val_len = int(seq_len * val_ratio)
     train = seq[:train_len]
     train_normal = train[train["labels"] == 0]
     train_normal = train_normal.sample(frac=1, random_state=42)
     train_abnormal = train[train["labels"] == 1]
     train_sample_len = int(len(train_normal) * (1-val_ratio))
     train = train_normal[:train_sample_len]
-    # train = train[train["labels"] == 0]
     
-    val_anomaly_len = int(0.1/0.9 * len(train_normal[train_sample_len:]))
-    validation = pd.concat([train_normal[train_sample_len:], train_abnormal[:val_anomaly_len]], axis=0)
+    # val_anomaly_len = int(0.1/0.9 * len(train_normal[train_sample_len:]))
+    # validation = pd.concat([train_normal[train_sample_len:], train_abnormal[:val_anomaly_len]], axis=0)
+    validation = train_normal[train_sample_len:]
     validation = validation.sample(frac=1, random_state=42)
-    # validation = seq[train_len:train_len+val_len]
 
-    test = seq[train_len:]
-
-    # train.rename(columns={"EventSequence":"text", "Label":"labels"}, inplace=True)
-    # validation.rename(columns={"EventSequence":"text", "Label":"labels"}, inplace=True)
-    # test.rename(columns={"EventSequence":"text", "Label":"labels"}, inplace=True)
-    # train.sort_index(inplace=True)
+    # test = seq[train_len:]
+    test = pd.concat([seq[train_len:], train_abnormal], axis=0)
 
     train_len = len(train)
     val_len = len(validation)
     test_len = len(test)
-    val_anomaly = len(validation[validation["labels"] == 1]) / val_len *100
+    # val_anomaly = len(validation[validation["labels"] == 1]) / val_len *100
     test_anomaly = len(test[test["labels"] == 1]) / test_len *100
    
     print("train size {0}, validation size {1}, test size {2}".format(train_len, val_len, test_len))
-    print("validation anomaly {0} %, test anomaly {1} %".format(val_anomaly, test_anomaly))
+    # print("validation anomaly {0} %, test anomaly {1} %".format(val_anomaly, test_anomaly))
+    print("test anomaly {0} %".format(test_anomaly))
 
     train.to_csv(output_dir + "train.csv", index=False)
     validation.to_csv(output_dir + "validation.csv", index=False)
@@ -197,8 +146,8 @@ def df_to_file(df, file_name):
 
 if __name__ == "__main__":
     # 1. parse HDFS log
-    # log_format = '<Date> <Time> <Pid> <Level> <Component>: <Content>'  # HDFS log format
-    # parser(input_dir, output_dir, log_file, log_format, 'drain')
-    # mapping()
+    log_format = '<Date> <Time> <Pid> <Level> <Component>: <Content>'  # HDFS log format
+    parser(input_dir, output_dir, log_file, log_format, 'drain')
+    mapping()
     hdfs_sampling(log_structured_file)
     generate_train_test(log_sequence_file)
