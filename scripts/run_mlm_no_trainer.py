@@ -286,7 +286,7 @@ def parse_args():
         "--max_save_limit",
         type=int,
         default=3,
-        help="The maximimum save limit of checkpoint",
+        help="The maximum number of checkpoints to save.",
     )
     args = parser.parse_args()
 
