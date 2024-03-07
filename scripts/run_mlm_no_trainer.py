@@ -21,7 +21,6 @@ Here is the full list of checkpoints on the hub that can be fine-tuned by this s
 https://huggingface.co/models?filter=fill-mask
 """
 # You can also adapt this script on your own mlm task. Pointers for this are left as comments.
-
 import argparse
 import json
 import logging
@@ -41,6 +40,7 @@ from datasets import load_dataset
 from huggingface_hub import Repository, create_repo
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
+import torch.nn as nn
 
 import transformers
 from transformers import (
@@ -58,6 +58,7 @@ from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
 from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score
 import numpy as np
+from model import model
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -288,6 +289,12 @@ def parse_args():
         default=3,
         help="The maximum number of checkpoints to save.",
     )
+    parser.add_argument(
+        "--encoder_name_or_path",
+        type=str,
+        default=None,
+        help="The name or path of the encoder model to use.",
+    )
     args = parser.parse_args()
 
     # Sanity checks
@@ -422,14 +429,17 @@ def main():
     #
     # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
-    if args.config_name:
-        config = AutoConfig.from_pretrained(args.config_name, trust_remote_code=args.trust_remote_code)
-    elif args.model_name_or_path:
-        config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=args.trust_remote_code)
-    else:
-        config = CONFIG_MAPPING[args.model_type]()
-        logger.warning("You are instantiating a new config instance from scratch.")
-    config.num_labels = 2
+    # if args.config_name:
+    #     config = AutoConfig.from_pretrained(args.config_name, trust_remote_code=args.trust_remote_code)
+    # elif args.model_name_or_path:
+    #     config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=args.trust_remote_code)
+    # else:
+    #     config = CONFIG_MAPPING[args.model_type]()
+    #     logger.warning("You are instantiating a new config instance from scratch.")
+    
+    if args.encoder_name_or_path:
+        encoder_config = AutoConfig.from_pretrained(args.encoder_name_or_path, trust_remote_code=args.trust_remote_code)
+
     print("*" * 1000)
     if args.tokenizer_name:
         tokenizer = AutoTokenizer.from_pretrained(
@@ -445,23 +455,36 @@ def main():
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
     print("*" * 1000)
-    if args.model_name_or_path:
-        model = AutoModel.from_pretrained(
-            args.model_name_or_path,
-            from_tf=bool(".ckpt" in args.model_name_or_path),
-            config=config,
+
+    # if args.model_name_or_path:
+    #     model = AutoModel.from_pretrained(
+    #         args.model_name_or_path,
+    #         from_tf=bool(".ckpt" in args.model_name_or_path),
+    #         config=config,
+    #         low_cpu_mem_usage=args.low_cpu_mem_usage,
+    #         trust_remote_code=args.trust_remote_code,
+    #     )
+    # else:
+    #     logger.info("Training new model from scratch")
+    #     model = AutoModel.from_config(config, trust_remote_code=args.trust_remote_code)
+
+    generator_model = model.Generator()
+    discriminator_model = model.Discriminator()
+    
+    if args.encoder_name_or_path:
+        encoder = AutoModel.from_pretrained(
+            args.encoder_name_or_path,
+            from_tf=bool(".ckpt" in args.encoder_name_or_path),
+            config=encoder_config,
             low_cpu_mem_usage=args.low_cpu_mem_usage,
             trust_remote_code=args.trust_remote_code,
         )
-    else:
-        logger.info("Training new model from scratch")
-        model = AutoModel.from_config(config, trust_remote_code=args.trust_remote_code)
 
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
-    embedding_size = model.get_input_embeddings().weight.shape[0]
+    embedding_size = encoder.get_input_embeddings().weight.shape[0]
     if len(tokenizer) > embedding_size:
-        model.resize_token_embeddings(len(tokenizer))
+        encoder.resize_token_embeddings(len(tokenizer))
 
     # Preprocessing the datasets.
     # First we tokenize all the texts.
@@ -585,118 +608,135 @@ def main():
                 desc=f"Grouping texts in chunks of {max_seq_length}",
             )
 
-    def precompute_logits(logits: torch.FloatTensor, k=5) -> torch.LongTensor:
-        # Get the top-k predictions
-        top_k_predictions = torch.topk(logits, k, dim=-1)[1]
+    # def precompute_logits(logits: torch.FloatTensor, k=5) -> torch.LongTensor:
+    #     # Get the top-k predictions
+    #     top_k_predictions = torch.topk(logits, k, dim=-1)[1]
 
-        return top_k_predictions
+        # return top_k_predictions
+    def precompute_logits(logits: torch.FloatTensor) -> torch.LongTensor:
+        # Get the argmax predictions
+        # print(logits.shape)
+        return torch.argmax(logits, dim=-1)
 
     def get_radius(dist: list, nu: float):
         """Optimally solve for radius R via the (1-nu)-quantile of distances."""
         return np.quantile(np.sqrt(dist), 1 - nu)
     
-    def compute_metrics_for_test(mlm_preds: np.ndarray, mlm_labels: np.ndarray, log_labels: np.ndarray) -> dict:
+    # def compute_metrics_for_test(mlm_preds: np.ndarray, mlm_labels: np.ndarray, log_labels: np.ndarray) -> dict:
 
-        top_k_accuracies = []
+    #     top_k_accuracies = []
 
-        for preds, lbls in zip(mlm_preds, mlm_labels):
-            # Remove -100 values
-            mask = lbls != -100
-            preds = preds[mask]
-            lbls = lbls[mask]
+    #     for preds, lbls in zip(mlm_preds, mlm_labels):
+    #         # Remove -100 values
+    #         mask = lbls != -100
+    #         preds = preds[mask]
+    #         lbls = lbls[mask]
 
-            # Check if the true labels are in the top-k predictions
-            correct = np.expand_dims(lbls, axis=-1) == preds
+    #         # Check if the true labels are in the top-k predictions
+    #         correct = np.expand_dims(lbls, axis=-1) == preds
 
-            # Compute the top-k accuracy for the current sentence
-            top_k_accuracy = correct.any(axis=-1).mean()
+    #         # Compute the top-k accuracy for the current sentence
+    #         top_k_accuracy = correct.any(axis=-1).mean()
             
-            # Replace NaN values with 0
-            top_k_accuracy = np.nan_to_num(top_k_accuracy, nan=0)
+    #         # Replace NaN values with 0
+    #         top_k_accuracy = np.nan_to_num(top_k_accuracy, nan=0)
 
-            top_k_accuracies.append(top_k_accuracy)
+    #         top_k_accuracies.append(top_k_accuracy)
         
-        return find_best_threshold(top_k_accuracies, np.linspace(0.51, 1.0), log_labels)
+    #     return find_best_threshold(top_k_accuracies, np.linspace(0.51, 1.0), log_labels)
     
-    def find_best_threshold(top_k_accuracies: list, accuracy_thresholds: np.ndarray, log_labels: np.ndarray) -> dict:
-        best_threshold = 0
-        best_f1 = 0
-        best_precision = 0
-        best_recall = 0
-        best_roc_auc = 0
-        used = 2
+    # def find_best_threshold(top_k_accuracies: list, accuracy_thresholds: np.ndarray, log_labels: np.ndarray) -> dict:
+    #     best_threshold = 0
+    #     best_f1 = 0
+    #     best_precision = 0
+    #     best_recall = 0
+    #     best_roc_auc = 0
+    #     used = 2
 
-        map_of_include = {
-            0: "both",
-            1: "radius",
-            2: "topk"
-        }
+    #     map_of_include = {
+    #         0: "both",
+    #         1: "radius",
+    #         2: "topk"
+    #     }
 
-        # for include in range(3):
-        #     if include == 0:
-        #         for threshold in accuracy_thresholds:
-        #             # Compute the predictions
-        #             preds = (np.array(top_k_accuracies) < threshold) | (dist > radius)
+    #     # for include in range(3):
+    #     #     if include == 0:
+    #     #         for threshold in accuracy_thresholds:
+    #     #             # Compute the predictions
+    #     #             preds = (np.array(top_k_accuracies) < threshold) | (dist > radius)
 
-        #             # Compute the metrics
-        #             f1 = f1_score(log_labels, preds, zero_division=0)
-        #             precision = precision_score(log_labels, preds, zero_division=0)
-        #             recall = recall_score(log_labels, preds, zero_division=0)
-        #             roc_auc = roc_auc_score(log_labels, preds)
+    #     #             # Compute the metrics
+    #     #             f1 = f1_score(log_labels, preds, zero_division=0)
+    #     #             precision = precision_score(log_labels, preds, zero_division=0)
+    #     #             recall = recall_score(log_labels, preds, zero_division=0)
+    #     #             roc_auc = roc_auc_score(log_labels, preds)
 
-        #             # Update the best metrics
-        #             if f1 > best_f1:
-        #                 best_threshold = threshold
-        #                 best_f1 = f1
-        #                 best_precision = precision
-        #                 best_recall = recall
-        #                 best_roc_auc = roc_auc
-        #                 used = include
-        #     elif include == 1:
-                # Compute the predictions
-        # preds = (dist > radius)
+    #     #             # Update the best metrics
+    #     #             if f1 > best_f1:
+    #     #                 best_threshold = threshold
+    #     #                 best_f1 = f1
+    #     #                 best_precision = precision
+    #     #                 best_recall = recall
+    #     #                 best_roc_auc = roc_auc
+    #     #                 used = include
+    #     #     elif include == 1:
+    #             # Compute the predictions
+    #     # preds = (dist > radius)
 
-        # # Compute the metrics
-        # f1 = f1_score(log_labels, preds, zero_division=0)
-        # precision = precision_score(log_labels, preds, zero_division=0)
-        # recall = recall_score(log_labels, preds, zero_division=0)
-        # roc_auc = roc_auc_score(log_labels, preds)
+    #     # # Compute the metrics
+    #     # f1 = f1_score(log_labels, preds, zero_division=0)
+    #     # precision = precision_score(log_labels, preds, zero_division=0)
+    #     # recall = recall_score(log_labels, preds, zero_division=0)
+    #     # roc_auc = roc_auc_score(log_labels, preds)
 
-        # # Update the best metrics
-        # if f1 > best_f1:
-        #     best_threshold = "none"
-        #     best_f1 = f1
-        #     best_precision = precision
-        #     best_recall = recall
-        #     best_roc_auc = roc_auc
-            # used = include
-            # else:
-        for threshold in accuracy_thresholds:
-            # Compute the predictions
-            preds = (np.array(top_k_accuracies) < threshold)
+    #     # # Update the best metrics
+    #     # if f1 > best_f1:
+    #     #     best_threshold = "none"
+    #     #     best_f1 = f1
+    #     #     best_precision = precision
+    #     #     best_recall = recall
+    #     #     best_roc_auc = roc_auc
+    #         # used = include
+    #         # else:
+    #     for threshold in accuracy_thresholds:
+    #         # Compute the predictions
+    #         preds = (np.array(top_k_accuracies) < threshold)
 
-            # Compute the metrics
-            f1 = f1_score(log_labels, preds, zero_division=0)
-            precision = precision_score(log_labels, preds, zero_division=0)
-            recall = recall_score(log_labels, preds, zero_division=0)
-            roc_auc = roc_auc_score(log_labels, preds)
+    #         # Compute the metrics
+    #         f1 = f1_score(log_labels, preds, zero_division=0)
+    #         precision = precision_score(log_labels, preds, zero_division=0)
+    #         recall = recall_score(log_labels, preds, zero_division=0)
+    #         roc_auc = roc_auc_score(log_labels, preds)
 
-            # Update the best metrics
-            if f1 > best_f1:
-                best_threshold = threshold
-                best_f1 = f1
-                best_precision = precision
-                best_recall = recall
-                best_roc_auc = roc_auc
-                # used = include
+    #         # Update the best metrics
+    #         if f1 > best_f1:
+    #             best_threshold = threshold
+    #             best_f1 = f1
+    #             best_precision = precision
+    #             best_recall = recall
+    #             best_roc_auc = roc_auc
+    #             # used = include
+
+    #     return {
+    #         "threshold": best_threshold,
+    #         "f1": best_f1,
+    #         "precision": best_precision,
+    #         "recall": best_recall,
+    #         "roc_auc": best_roc_auc,
+    #         "include": map_of_include[used] if used in map_of_include else "none"
+    #     }
+    def compute_metrics_for_test(preds, labels):
+        # calculate auroc, f1, precision, recall
+        f1 = f1_score(labels, preds, zero_division=0)
+        precision = precision_score(labels, preds, zero_division=0)
+        recall = recall_score(labels, preds, zero_division=0)
+        auroc = roc_auc_score(labels, preds)
 
         return {
-            "threshold": best_threshold,
-            "f1": best_f1,
-            "precision": best_precision,
-            "recall": best_recall,
-            "roc_auc": best_roc_auc,
-            "include": map_of_include[used] if used in map_of_include else "none"
+            "f1": f1,
+            "precision": precision,
+            "recall": recall,
+            "auroc": auroc
         }
 
     train_dataset = tokenized_datasets["train"]
@@ -728,18 +768,19 @@ def main():
 
     # Optimizer
     # Split weights in two groups, one with weight decay and the other not.
-    no_decay = ["bias", "LayerNorm.weight"]
-    optimizer_grouped_parameters = [
-        {
-            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-            "weight_decay": args.weight_decay,
-        },
-        {
-            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
-            "weight_decay": 0.0,
-        },
-    ]
-    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+    # no_decay = ["bias", "LayerNorm.weight"]
+    # optimizer_grouped_parameters = [
+    #     {
+    #         "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+    #         "weight_decay": args.weight_decay,
+    #     },
+    #     {
+    #         "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+    #         "weight_decay": 0.0,
+    #     },
+    # ]
+    g_optimizer = torch.optim.AdamW(generator_model.parameters(), lr=args.learning_rate)
+    d_optimizer = torch.optim.AdamW(discriminator_model.parameters(), lr=args.learning_rate)
 
     # Note -> the training dataloader needs to be prepared before we grab his length below (cause its length will be
     # shorter in multiprocess)
@@ -751,21 +792,33 @@ def main():
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
 
-    lr_scheduler = get_scheduler(
+    g_lr_scheduler = get_scheduler(
         name=args.lr_scheduler_type,
-        optimizer=optimizer,
+        optimizer=g_optimizer,
+        num_warmup_steps=args.num_warmup_steps * accelerator.num_processes,
+        num_training_steps=args.max_train_steps if overrode_max_train_steps else args.max_train_steps * accelerator.num_processes,
+    )
+
+    d_lr_scheduler = get_scheduler(
+        name=args.lr_scheduler_type,
+        optimizer=d_optimizer,
         num_warmup_steps=args.num_warmup_steps * accelerator.num_processes,
         num_training_steps=args.max_train_steps if overrode_max_train_steps else args.max_train_steps * accelerator.num_processes,
     )
 
     # Prepare everything with our `accelerator`.
-    model, optimizer, train_dataloader, eval_dataloader, test_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, eval_dataloader, test_dataloader, lr_scheduler
-    )
+    if args.encoder_name_or_path:
+        generator_model, discriminator_model, encoder, g_optimizer, d_optimizer, train_dataloader, eval_dataloader, test_dataloader, g_lr_scheduler, d_lr_scheduler = accelerator.prepare(
+            generator_model, discriminator_model, encoder, g_optimizer, d_optimizer, train_dataloader, eval_dataloader, test_dataloader, g_lr_scheduler, d_lr_scheduler
+        )
+    else:
+        generator_model, discriminator_model, g_optimizer, d_optimizer, train_dataloader, eval_dataloader, test_dataloader, g_lr_scheduler, d_lr_scheduler = accelerator.prepare(
+            generator_model, discriminator_model, g_optimizer, d_optimizer, train_dataloader, eval_dataloader, test_dataloader, g_lr_scheduler, d_lr_scheduler
+        )
 
     # On TPU, the tie weights in our model have been disconnected, so we need to restore the ties.
-    if accelerator.distributed_type == DistributedType.TPU:
-        model.tie_weights()
+    # if accelerator.distributed_type == DistributedType.TPU:
+    #     model.tie_weights()
     print(len(train_dataloader))
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -837,11 +890,18 @@ def main():
     best_val_loss = float("inf")
     best_model_dir = None
     epochs_no_improve = 0
+    normal_label = 1
+    anomaly_label = 0
+    discriminator_criterion = nn.BCEWithLogitsLoss()
+    generator_ae_criterion = nn.MSELoss()
 
     for epoch in range(starting_epoch, args.num_train_epochs):
         # total_dist = []
         # radius = 0
-        model.train()
+        if args.encoder_name_or_path:
+            encoder.train()
+        generator_model.train()
+        discriminator_model.train()
         if args.with_tracking:
             total_loss = 0
         if args.resume_from_checkpoint and epoch == starting_epoch and resume_step is not None:
@@ -864,18 +924,81 @@ def main():
 
         # center = outputs / total_samples
         # model.module.center = center
-
+        losses = []
         for step, batch in enumerate(active_dataloader):
-            with accelerator.accumulate(model):
-                outputs = model(**batch)
-                loss = outputs.loss
-                # We keep track of the loss at each epoch
-                if args.with_tracking:
-                    total_loss += loss.detach().float()
-                accelerator.backward(loss)
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+            # with accelerator.accumulate(model):
+                # if args.encoder_name_or_path:
+            with torch.no_grad():
+                encodings = encoder(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
+
+                #     outputs = model(encodings.last_hidden_state)
+                #     loss = outputs.loss
+                #     # We keep track of the loss at each epoch
+                #     if args.with_tracking:
+                #         total_loss += loss.detach().float()
+                #     accelerator.backward(loss)
+                #     optimizer.step()
+                #     lr_scheduler.step()
+                #     optimizer.zero_grad()
+            ############################
+            # (1) Update D network: maximize log(D(x)) + log(1 - D(G(z)))
+            ###########################
+            ## Train with all-real batch
+            d_optimizer.zero_grad()
+            # Format batch
+            batch_size = encodings.last_hidden_state.size(0)
+            # label = torch.full((batch_size,), normal_label, dtype=torch.long, device=accelerator.device)
+
+            # Create a tensor of ones with shape (8, 1)
+            ones = torch.ones((batch_size, 1), dtype=torch.float, device=accelerator.device)
+
+            # Create a tensor of zeros with shape (8, 1)
+            zeros = torch.zeros((batch_size, 1), dtype=torch.float, device=accelerator.device)
+
+            # Concatenate the tensors along the second dimension
+            label = torch.cat((ones, zeros), dim=1)
+
+            # Forward pass real batch through D
+            output = discriminator_model(encodings.last_hidden_state)
+            # Calculate loss on all-real batch
+            errD_real = discriminator_criterion(output, label)
+            # Calculate gradients for D in backward pass
+
+            ## Train with all-fake batch
+            # Generate batch of latent vectors
+            # Generate fake image batch with G
+            fake = generator_model(encodings.last_hidden_state)
+            # Invert the 1s and 0s in the label tensor
+            label = 1 - label
+            # label.fill_(anomaly_label)
+            # Classify all fake batch with D
+            output = discriminator_model(fake.detach())
+            # Calculate D's loss on the all-fake batch
+            errD_fake = discriminator_criterion(output, label)
+            # Calculate the gradients for this batch, accumulated (summed) with previous gradients
+            total_loss_D = errD_real + errD_fake / 2 
+            accelerator.backward(total_loss_D)
+            # Compute error of D as sum over the fake and the real batches
+            # Update D
+            d_optimizer.step()
+            losses.append(accelerator.gather_for_metrics(total_loss_D.repeat(args.per_device_train_batch_size)))
+            ############################
+            # (2) Update G network: maximize log(D(G(z)))
+            ###########################
+            g_optimizer.zero_grad()
+            # label.fill_(normal_label)  # fake labels are real for generator cost
+            # Invert the 1s and 0s in the label tensor
+            label = 1 - label
+            # Since we just updated D, perform another forward pass of all-fake batch through D
+            output = discriminator_model(fake)
+            # Calculate G's loss based on this output
+            errG = discriminator_criterion(output, label)
+            reconstruction_loss = generator_ae_criterion(fake, encodings.last_hidden_state)
+            discriminator_loss = errG + reconstruction_loss / 2
+            # Calculate gradients for G
+            accelerator.backward(discriminator_loss)
+            # Update G
+            g_optimizer.step()
 
             # total_dist += accelerator.gather(outputs.dist).cpu().tolist()
 
@@ -893,14 +1016,38 @@ def main():
 
             if completed_steps >= args.max_train_steps:
                 break
+        
+        losses = torch.cat(losses)
+        total_train_loss = torch.mean(losses)
+        logger.info(f"epoch: {epoch} train_loss: {total_train_loss}")
 
-        model.eval()
+
+        encoder.eval()
+        generator_model.eval()
+        discriminator_model.eval()
         losses = []
         for step, batch in enumerate(eval_dataloader):
             with torch.no_grad():
-                outputs = model(**batch)
+                encodings = encoder(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
+                fake = generator_model(encodings.last_hidden_state)
+                batch_size = encodings.last_hidden_state.size(0)
+                # Create a tensor of ones with shape (8, 1)
+                ones = torch.ones((batch_size, 1), dtype=torch.float, device=accelerator.device)
 
-            loss = outputs.loss
+                # Create a tensor of zeros with shape (8, 1)
+                zeros = torch.zeros((batch_size, 1), dtype=torch.float, device=accelerator.device)
+
+                # Concatenate the tensors along the second dimension
+                label = torch.cat((zeros, ones), dim=1)
+
+                output = discriminator_model(fake)
+                errG = discriminator_criterion(output, label)
+                output = discriminator_model(encodings.last_hidden_state)
+                label = 1 - label
+                errD_real = discriminator_criterion(output, label)
+
+
+            loss = errG + errD_real / 2
             losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
 
             # total_dist += accelerator.gather(outputs.dist).cpu().tolist()
@@ -927,8 +1074,8 @@ def main():
                 step=completed_steps,
             )
 
-        if eval_loss < best_val_loss:
-            best_val_loss = eval_loss
+        if total_train_loss < best_val_loss:
+            best_val_loss = total_train_loss
             best_model_dir = f"epoch_{epoch}"
             # radius = get_radius(total_dist, args.nu)
 
@@ -946,17 +1093,17 @@ def main():
         else:
             epochs_no_improve += 1
         
-        if args.push_to_hub and epoch < args.num_train_epochs - 1:
-            accelerator.wait_for_everyone()
-            unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_model.save_pretrained(
-                args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
-            )
-            if accelerator.is_main_process:
-                tokenizer.save_pretrained(args.output_dir)
-                repo.push_to_hub(
-                    commit_message=f"Training in progress epoch {epoch}", blocking=False, auto_lfs_prune=True
-                )
+        # if args.push_to_hub and epoch < args.num_train_epochs - 1:
+        #     accelerator.wait_for_everyone()
+        #     unwrapped_model = accelerator.unwrap_model(model)
+        #     unwrapped_model.save_pretrained(
+        #         args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
+        #     )
+        #     if accelerator.is_main_process:
+        #         tokenizer.save_pretrained(args.output_dir)
+        #         repo.push_to_hub(
+        #             commit_message=f"Training in progress epoch {epoch}", blocking=False, auto_lfs_prune=True
+        #         )
 
         if args.checkpointing_steps == "epoch":
             output_dir = f"epoch_{epoch}"
@@ -994,27 +1141,35 @@ def main():
     # radius = best_attributes['best_radius']
     # center = best_attributes['best_center']
     # model.module.center = center
-    model.eval()
+    # model.eval()
     # accelerator.wait_for_everyone()
+    encoder.eval()
+    discriminator_model.eval()
+    generator_model.eval()
 
-    mlm_preds = []
-    mlm_labels = []
+    # mlm_preds = []
+    # mlm_labels = []
     log_labels = []
+    preds = []
     # dist = []
     for steps, batch in enumerate(test_dataloader):
         with torch.no_grad():
-            outputs = model(**batch)
+            encodings = encoder(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
+            output = discriminator_model(encodings.last_hidden_state)
 
-        mlm_preds.append(accelerator.gather(precompute_logits(outputs.mlm_logits, k=5)).cpu().numpy())
-        mlm_labels.append(accelerator.gather(batch["labels"]).cpu().numpy())
+        # mlm_preds.append(accelerator.gather(precompute_logits(outputs.mlm_logits, k=5)).cpu().numpy())
+        # mlm_labels.append(accelerator.gather(batch["labels"]).cpu().numpy())
+        preds.append(accelerator.gather(precompute_logits(output)).cpu().numpy())
         log_labels.append(accelerator.gather(batch["log_labels"]).cpu().numpy())
         # dist.append(accelerator.gather(outputs.dist).cpu().numpy())
 
-    mlm_preds = np.concatenate(mlm_preds)
-    mlm_labels = np.concatenate(mlm_labels)
+    # mlm_preds = np.concatenate(mlm_preds)
+    # mlm_labels = np.concatenate(mlm_labels)
     log_labels = np.concatenate(log_labels)
+    preds = np.concatenate(preds)
+    # print(preds[0])
     # dist = np.concatenate(dist)
-    results = compute_metrics_for_test(mlm_preds, mlm_labels, log_labels)
+    results = compute_metrics_for_test(preds, log_labels)
     logger.info(f"{results}")
 
     if args.with_tracking:
@@ -1022,18 +1177,18 @@ def main():
 
     if args.output_dir is not None:
         accelerator.wait_for_everyone()
-        unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.save_pretrained(
-            args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save, safe_serialization=False
-        )
-        if accelerator.is_main_process:
-            tokenizer.save_pretrained(args.output_dir)
-            if args.push_to_hub:
-                repo.push_to_hub(commit_message="End of training", auto_lfs_prune=True)
+        # unwrapped_model = accelerator.unwrap_model(model)
+        # unwrapped_model.save_pretrained(
+        #     args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save, safe_serialization=False
+        # )
+        # if accelerator.is_main_process:
+        #     tokenizer.save_pretrained(args.output_dir)
+        #     if args.push_to_hub:
+        #         repo.push_to_hub(commit_message="End of training", auto_lfs_prune=True)
 
-            with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
-                # json.dump({"perplexity": perplexity}, f)
-                json.dump(results, f)
+        with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
+            # json.dump({"perplexity": perplexity}, f)
+            json.dump(results, f)
 
 
 if __name__ == "__main__":
