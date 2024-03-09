@@ -469,7 +469,7 @@ def main():
     #     model = AutoModel.from_config(config, trust_remote_code=args.trust_remote_code)
 
     generator_model = model.Generator()
-    discriminator_model = model.Discriminator()
+    discriminator_model = model.LSTMDiscriminator()
     
     if args.encoder_name_or_path:
         encoder = AutoModel.from_pretrained(
@@ -522,16 +522,6 @@ def main():
                 # receives the `special_tokens_mask`.
                 return_special_tokens_mask=False,
             )
-
-            # secondary_batch = tokenizer(
-            #     examples["EventId"],
-            #     padding=padding,
-            #     truncation=True,
-            #     max_length=max_seq_length,
-            # )
-
-            # batch['secondary_input_ids'] = secondary_batch['input_ids']
-            # batch['secondary_attention_mask'] = secondary_batch['attention_mask']
             batch['log_labels'] = examples['labels']
             return batch
 
@@ -608,15 +598,9 @@ def main():
                 desc=f"Grouping texts in chunks of {max_seq_length}",
             )
 
-    # def precompute_logits(logits: torch.FloatTensor, k=5) -> torch.LongTensor:
-    #     # Get the top-k predictions
-    #     top_k_predictions = torch.topk(logits, k, dim=-1)[1]
-
-        # return top_k_predictions
     def precompute_logits(logits: torch.FloatTensor) -> torch.LongTensor:
-        # Get the argmax predictions
-        # print(logits.shape)
-        return torch.argmax(logits, dim=-1)
+        # Discriminate if < 0.5 
+        return (logits < 0.5).long().flatten()
 
     def get_radius(dist: list, nu: float):
         """Optimally solve for radius R via the (1-nu)-quantile of distances."""
@@ -725,18 +709,19 @@ def main():
     #         "roc_auc": best_roc_auc,
     #         "include": map_of_include[used] if used in map_of_include else "none"
     #     }
-    def compute_metrics_for_test(preds, labels):
+    def compute_metrics_for_test(labels: np.ndarray, preds: np.ndarray) -> dict:
         # calculate auroc, f1, precision, recall
+        print(labels, preds)
         f1 = f1_score(labels, preds, zero_division=0)
         precision = precision_score(labels, preds, zero_division=0)
         recall = recall_score(labels, preds, zero_division=0)
-        auroc = roc_auc_score(labels, preds)
+        # auroc = roc_auc_score(labels, preds)
 
         return {
             "f1": f1,
             "precision": precision,
             "recall": recall,
-            "auroc": auroc
+            # "auroc": auroc
         }
 
     train_dataset = tokenized_datasets["train"]
@@ -924,7 +909,8 @@ def main():
 
         # center = outputs / total_samples
         # model.module.center = center
-        losses = []
+        d_losses = []   
+        g_losses = []
         for step, batch in enumerate(active_dataloader):
             # with accelerator.accumulate(model):
                 # if args.encoder_name_or_path:
@@ -947,19 +933,10 @@ def main():
             d_optimizer.zero_grad()
             # Format batch
             batch_size = encodings.last_hidden_state.size(0)
-            # label = torch.full((batch_size,), normal_label, dtype=torch.long, device=accelerator.device)
-
-            # Create a tensor of ones with shape (8, 1)
-            ones = torch.ones((batch_size, 1), dtype=torch.float, device=accelerator.device)
-
-            # Create a tensor of zeros with shape (8, 1)
-            zeros = torch.zeros((batch_size, 1), dtype=torch.float, device=accelerator.device)
-
-            # Concatenate the tensors along the second dimension
-            label = torch.cat((ones, zeros), dim=1)
+            label = torch.full((batch_size,), normal_label, dtype=torch.float, device=accelerator.device)
 
             # Forward pass real batch through D
-            output = discriminator_model(encodings.last_hidden_state)
+            output = discriminator_model(encodings.last_hidden_state).view(-1)
             # Calculate loss on all-real batch
             errD_real = discriminator_criterion(output, label)
             # Calculate gradients for D in backward pass
@@ -968,11 +945,9 @@ def main():
             # Generate batch of latent vectors
             # Generate fake image batch with G
             fake = generator_model(encodings.last_hidden_state)
-            # Invert the 1s and 0s in the label tensor
-            label = 1 - label
-            # label.fill_(anomaly_label)
+            label = torch.full((batch_size,), anomaly_label, dtype=torch.float, device=accelerator.device)
             # Classify all fake batch with D
-            output = discriminator_model(fake.detach())
+            output = discriminator_model(fake.detach()).view(-1)
             # Calculate D's loss on the all-fake batch
             errD_fake = discriminator_criterion(output, label)
             # Calculate the gradients for this batch, accumulated (summed) with previous gradients
@@ -981,24 +956,23 @@ def main():
             # Compute error of D as sum over the fake and the real batches
             # Update D
             d_optimizer.step()
-            losses.append(accelerator.gather_for_metrics(total_loss_D.repeat(args.per_device_train_batch_size)))
+            d_losses.append(accelerator.gather_for_metrics(total_loss_D.repeat(args.per_device_train_batch_size)))
             ############################
             # (2) Update G network: maximize log(D(G(z)))
             ###########################
             g_optimizer.zero_grad()
-            # label.fill_(normal_label)  # fake labels are real for generator cost
-            # Invert the 1s and 0s in the label tensor
-            label = 1 - label
+            label = torch.full((batch_size,), normal_label, dtype=torch.float, device=accelerator.device) # fake labels are real for generator cost
             # Since we just updated D, perform another forward pass of all-fake batch through D
-            output = discriminator_model(fake)
+            output = discriminator_model(fake).view(-1)
             # Calculate G's loss based on this output
             errG = discriminator_criterion(output, label)
             reconstruction_loss = generator_ae_criterion(fake, encodings.last_hidden_state)
-            discriminator_loss = errG + reconstruction_loss / 2
+            total_loss_G = errG + reconstruction_loss / 2
             # Calculate gradients for G
-            accelerator.backward(discriminator_loss)
+            accelerator.backward(total_loss_G)
             # Update G
             g_optimizer.step()
+            g_losses.append(accelerator.gather_for_metrics(total_loss_G.repeat(args.per_device_train_batch_size)))
 
             # total_dist += accelerator.gather(outputs.dist).cpu().tolist()
 
@@ -1017,65 +991,47 @@ def main():
             if completed_steps >= args.max_train_steps:
                 break
         
-        losses = torch.cat(losses)
-        total_train_loss = torch.mean(losses)
-        logger.info(f"epoch: {epoch} train_loss: {total_train_loss}")
+        d_losses = torch.cat(d_losses)
+        g_losses = torch.cat(g_losses)
+        total_g_loss = torch.mean(g_losses)
+        total_d_loss = torch.mean(d_losses)
+        logger.info(f"epoch: {epoch} g_loss: {total_g_loss} d_loss: {total_d_loss}")
 
+        # encoder.eval()
+        # generator_model.eval()
+        # discriminator_model.eval()
+        # losses = []
+        # for step, batch in enumerate(eval_dataloader):
+        #     with torch.no_grad():
+                
+        #     losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
 
-        encoder.eval()
-        generator_model.eval()
-        discriminator_model.eval()
-        losses = []
-        for step, batch in enumerate(eval_dataloader):
-            with torch.no_grad():
-                encodings = encoder(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
-                fake = generator_model(encodings.last_hidden_state)
-                batch_size = encodings.last_hidden_state.size(0)
-                # Create a tensor of ones with shape (8, 1)
-                ones = torch.ones((batch_size, 1), dtype=torch.float, device=accelerator.device)
-
-                # Create a tensor of zeros with shape (8, 1)
-                zeros = torch.zeros((batch_size, 1), dtype=torch.float, device=accelerator.device)
-
-                # Concatenate the tensors along the second dimension
-                label = torch.cat((zeros, ones), dim=1)
-
-                output = discriminator_model(fake)
-                errG = discriminator_criterion(output, label)
-                output = discriminator_model(encodings.last_hidden_state)
-                label = 1 - label
-                errD_real = discriminator_criterion(output, label)
-
-
-            loss = errG + errD_real / 2
-            losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
-
-            # total_dist += accelerator.gather(outputs.dist).cpu().tolist()
+        #     # total_dist += accelerator.gather(outputs.dist).cpu().tolist()
     
-        losses = torch.cat(losses)
-        # try:
-        eval_loss = torch.mean(losses)
-            # perplexity = math.exp(eval_loss)
-        # except OverflowError:
-            # perplexity = float("inf")
+        # losses = torch.cat(losses)
+        # # try:
+        # eval_loss = torch.mean(losses)
+        #     # perplexity = math.exp(eval_loss)
+        # # except OverflowError:
+        #     # perplexity = float("inf")
 
-        # logger.info(f"epoch {epoch}: perplexity: {perplexity} eval_loss: {eval_loss}")
-        logger.info(f"epoch: {epoch} eval_loss: {eval_loss}")
+        # # logger.info(f"epoch {epoch}: perplexity: {perplexity} eval_loss: {eval_loss}")
+        # logger.info(f"epoch: {epoch} eval_loss: {eval_loss}")
 
-        if args.with_tracking:
-            accelerator.log(
-                {
-                    # "perplexity": perplexity,
-                    "eval_loss": eval_loss,
-                    "train_loss": total_loss.item() / len(train_dataloader),
-                    "epoch": epoch,
-                    "step": completed_steps,
-                },
-                step=completed_steps,
-            )
+        # if args.with_tracking:
+        #     accelerator.log(
+        #         {
+        #             # "perplexity": perplexity,
+        #             "eval_loss": eval_loss,
+        #             "train_loss": total_loss.item() / len(train_dataloader),
+        #             "epoch": epoch,
+        #             "step": completed_steps,
+        #         },
+        #         step=completed_steps,
+        #     )
 
-        if total_train_loss < best_val_loss:
-            best_val_loss = total_train_loss
+        if total_d_loss < best_val_loss:
+            best_val_loss = total_d_loss
             best_model_dir = f"epoch_{epoch}"
             # radius = get_radius(total_dist, args.nu)
 
