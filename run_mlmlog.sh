@@ -2,7 +2,7 @@ DATASET_NAME=bgl
 main_process_port=$(( $RANDOM % 10 + 29500 ))
 echo "Main process port: $main_process_port"
 
-NUM_SAMPLES=5000
+NUM_SAMPLES=500
 export PYTHONPATH="${PYTHONPATH}:./"
 accelerate launch --main_process_port $main_process_port scripts/run_mlm_no_trainer.py \
     --train_file data/${DATASET_NAME}/train.csv \

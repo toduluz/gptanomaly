@@ -41,6 +41,7 @@ from huggingface_hub import Repository, create_repo
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 import torch.nn as nn
+import torch.nn.functional as F
 
 import transformers
 from transformers import (
@@ -598,9 +599,9 @@ def main():
                 desc=f"Grouping texts in chunks of {max_seq_length}",
             )
 
-    def precompute_logits(logits: torch.FloatTensor) -> torch.LongTensor:
-        # Discriminate if < 0.5 
-        return (logits < 0.5).long().flatten()
+    def pre_compute_probs_val(d_probs):
+        result = torch.argmax(d_probs, dim=-1)
+        return result
 
     def get_radius(dist: list, nu: float):
         """Optimally solve for radius R via the (1-nu)-quantile of distances."""
@@ -711,7 +712,6 @@ def main():
     #     }
     def compute_metrics_for_test(labels: np.ndarray, preds: np.ndarray) -> dict:
         # calculate auroc, f1, precision, recall
-        print(labels, preds)
         f1 = f1_score(labels, preds, zero_division=0)
         precision = precision_score(labels, preds, zero_division=0)
         recall = recall_score(labels, preds, zero_division=0)
@@ -872,13 +872,10 @@ def main():
     # update the progress_bar if load from checkpoint
     progress_bar.update(completed_steps)
 
-    best_val_loss = float("inf")
+    best_val_acc = 0
     best_model_dir = None
     epochs_no_improve = 0
-    normal_label = 1
-    anomaly_label = 0
-    discriminator_criterion = nn.BCEWithLogitsLoss()
-    generator_ae_criterion = nn.MSELoss()
+    epsilon = 1e-8
 
     for epoch in range(starting_epoch, args.num_train_epochs):
         # total_dist = []
@@ -926,53 +923,64 @@ def main():
                 #     optimizer.step()
                 #     lr_scheduler.step()
                 #     optimizer.zero_grad()
-            ############################
-            # (1) Update D network: maximize log(D(x)) + log(1 - D(G(z)))
-            ###########################
-            ## Train with all-real batch
-            d_optimizer.zero_grad()
-            # Format batch
-            batch_size = encodings.last_hidden_state.size(0)
-            label = torch.full((batch_size,), normal_label, dtype=torch.float, device=accelerator.device)
 
-            # Forward pass real batch through D
-            output = discriminator_model(encodings.last_hidden_state).view(-1)
-            # Calculate loss on all-real batch
-            errD_real = discriminator_criterion(output, label)
-            # Calculate gradients for D in backward pass
-
-            ## Train with all-fake batch
-            # Generate batch of latent vectors
-            # Generate fake image batch with G
             fake = generator_model(encodings.last_hidden_state)
-            label = torch.full((batch_size,), anomaly_label, dtype=torch.float, device=accelerator.device)
-            # Classify all fake batch with D
-            output = discriminator_model(fake.detach()).view(-1)
-            # Calculate D's loss on the all-fake batch
-            errD_fake = discriminator_criterion(output, label)
-            # Calculate the gradients for this batch, accumulated (summed) with previous gradients
-            total_loss_D = errD_real + errD_fake / 2 
-            accelerator.backward(total_loss_D)
-            # Compute error of D as sum over the fake and the real batches
-            # Update D
-            d_optimizer.step()
-            d_losses.append(accelerator.gather_for_metrics(total_loss_D.repeat(args.per_device_train_batch_size)))
-            ############################
-            # (2) Update G network: maximize log(D(G(z)))
-            ###########################
+            discriminator_input = torch.cat([encodings.last_hidden_state, fake], dim=0)
+            logits, prob = discriminator_model(discriminator_input)
+            batch_size = encodings.last_hidden_state.size(0)
+            logits_list = torch.split(logits, batch_size)
+            d_real_logits = logits_list[0]
+            d_fake_logits = logits_list[1]
+
+            prob_list = torch.split(prob, batch_size)
+            d_real_probs = prob_list[0]
+            d_fake_probs = prob_list[1]
+
+            #---------------------------------
+            #  LOSS evaluation
+            #---------------------------------
+            # Generator's LOSS estimation
+            g_loss_d = -1 * torch.mean(torch.log(1 - d_fake_probs[:,-1] + epsilon))
+            g_feat_reg = torch.mean(torch.pow(torch.mean(encodings.last_hidden_state, dim=0) - torch.mean(fake, dim=0), 2))
+            g_loss = g_loss_d + g_feat_reg
+
+            # Disciminator's LOSS estimation
+            log_probs = F.log_softmax(d_real_logits, dim=-1)
+            per_example_loss = -torch.sum(log_probs, dim=-1)
+            D_L_Supervised = torch.div(torch.sum(per_example_loss), batch_size)
+                    
+            D_L_unsupervised1U = -1 * torch.mean(torch.log(1 - d_real_probs[:, -1] + epsilon))
+            D_L_unsupervised2U = -1 * torch.mean(torch.log(d_fake_probs[:, -1] + epsilon))
+            d_loss = D_L_Supervised + D_L_unsupervised1U + D_L_unsupervised2U
+
+            #---------------------------------
+            #  OPTIMIZATION
+            #---------------------------------
+            # Avoid gradient accumulation
             g_optimizer.zero_grad()
-            label = torch.full((batch_size,), normal_label, dtype=torch.float, device=accelerator.device) # fake labels are real for generator cost
-            # Since we just updated D, perform another forward pass of all-fake batch through D
-            output = discriminator_model(fake).view(-1)
-            # Calculate G's loss based on this output
-            errG = discriminator_criterion(output, label)
-            reconstruction_loss = generator_ae_criterion(fake, encodings.last_hidden_state)
-            total_loss_G = errG + reconstruction_loss / 2
-            # Calculate gradients for G
-            accelerator.backward(total_loss_G)
-            # Update G
+            d_optimizer.zero_grad()
+
+            # Calculate weigth updates
+            # retain_graph=True is required since the underlying graph will be deleted after backward
+            accelerator.backward(g_loss, retain_graph=True)
+            accelerator.backward(d_loss) 
+            
+            # Apply modifications
             g_optimizer.step()
-            g_losses.append(accelerator.gather_for_metrics(total_loss_G.repeat(args.per_device_train_batch_size)))
+            d_optimizer.step()
+
+            # A detail log of the individual losses
+            #print("{0:.4f}\t{1:.4f}\t{2:.4f}\t{3:.4f}\t{4:.4f}".
+            #      format(D_L_Supervised, D_L_unsupervised1U, D_L_unsupervised2U,
+            #             g_loss_d, g_feat_reg))
+
+            # Save the losses to print them later
+            d_losses.append(accelerator.gather_for_metrics(d_loss.repeat(args.per_device_train_batch_size)))
+            g_losses.append(accelerator.gather_for_metrics(g_loss.repeat(args.per_device_train_batch_size)))
+
+            # Update the learning rate with the scheduler
+            g_lr_scheduler.step()
+            d_lr_scheduler.step()
 
             # total_dist += accelerator.gather(outputs.dist).cpu().tolist()
 
@@ -997,13 +1005,66 @@ def main():
         total_d_loss = torch.mean(d_losses)
         logger.info(f"epoch: {epoch} g_loss: {total_g_loss} d_loss: {total_d_loss}")
 
-        # encoder.eval()
-        # generator_model.eval()
-        # discriminator_model.eval()
-        # losses = []
-        # for step, batch in enumerate(eval_dataloader):
-        #     with torch.no_grad():
-                
+        encoder.eval()
+        generator_model.eval()
+        discriminator_model.eval()
+        d_losses = []
+        g_losses = []
+        real_preds = []
+        fake_preds = []
+        for step, batch in enumerate(eval_dataloader):
+            with torch.no_grad():
+                encodings = encoder(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
+                fake = generator_model(encodings.last_hidden_state)
+                discriminator_input = torch.cat([encodings.last_hidden_state, fake], dim=0)
+                logits, probs = discriminator_model(discriminator_input)
+                batch_size = encodings.last_hidden_state.size(0)
+                logits_list = torch.split(logits, batch_size)
+                d_real_logits = logits_list[0]
+                d_fake_logits = logits_list[1]
+
+                prob_list = torch.split(probs, batch_size)
+                d_real_probs = prob_list[0]
+                d_fake_probs = prob_list[1]
+
+                #---------------------------------
+                #  LOSS evaluation
+                #---------------------------------
+                # Generator's LOSS estimation
+                g_loss_d = -1 * torch.mean(torch.log(1 - d_fake_probs[:,-1] + epsilon))
+                g_feat_reg = torch.mean(torch.pow(torch.mean(encodings.last_hidden_state, dim=0) - torch.mean(fake, dim=0), 2))
+                g_loss = g_loss_d + g_feat_reg
+
+                # Disciminator's LOSS estimation
+                log_probs = F.log_softmax(d_real_logits, dim=-1)
+                per_example_loss = -torch.sum(log_probs, dim=-1)
+                D_L_Supervised = torch.div(torch.sum(per_example_loss), batch_size)
+
+                D_L_unsupervised1U = -1 * torch.mean(torch.log(1 - d_real_probs[:, -1] + epsilon))
+                D_L_unsupervised2U = -1 * torch.mean(torch.log(d_fake_probs[:, -1] + epsilon))
+                d_loss = D_L_Supervised + D_L_unsupervised1U + D_L_unsupervised2U
+
+                # Save the losses to print them later
+                d_losses.append(accelerator.gather_for_metrics(d_loss.repeat(args.per_device_eval_batch_size)))
+                g_losses.append(accelerator.gather_for_metrics(g_loss.repeat(args.per_device_eval_batch_size)))
+
+                # Save the preds
+                real_preds.append(accelerator.gather(pre_compute_probs_val(d_real_probs)).cpu().numpy())
+                fake_preds.append(accelerator.gather(pre_compute_probs_val(d_fake_probs)).cpu().numpy())
+
+        d_losses = torch.cat(d_losses)
+        g_losses = torch.cat(g_losses)
+        total_g_loss = torch.mean(g_losses)
+        total_d_loss = torch.mean(d_losses)
+
+        real_preds = np.concatenate(real_preds)
+        fake_preds = np.concatenate(fake_preds)
+        # Calculate number of 0
+        real_preds_acc = np.sum(real_preds == 0) / len(real_preds)
+        fake_preds_acc = np.sum(fake_preds == 1) / len(fake_preds)
+        avg_acc = (real_preds_acc + fake_preds_acc) / 2
+        logger.info(f"epoch: {epoch} eval_g_loss: {total_g_loss} eval_d_loss: {total_d_loss} accuracy: {avg_acc}")
+
         #     losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
 
         #     # total_dist += accelerator.gather(outputs.dist).cpu().tolist()
@@ -1030,8 +1091,8 @@ def main():
         #         step=completed_steps,
         #     )
 
-        if total_d_loss < best_val_loss:
-            best_val_loss = total_d_loss
+        if avg_acc > best_val_acc:
+            best_val_acc = avg_acc
             best_model_dir = f"epoch_{epoch}"
             # radius = get_radius(total_dist, args.nu)
 
@@ -1111,11 +1172,11 @@ def main():
     for steps, batch in enumerate(test_dataloader):
         with torch.no_grad():
             encodings = encoder(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
-            output = discriminator_model(encodings.last_hidden_state)
+            logits, probs = discriminator_model(encodings.last_hidden_state)
 
         # mlm_preds.append(accelerator.gather(precompute_logits(outputs.mlm_logits, k=5)).cpu().numpy())
         # mlm_labels.append(accelerator.gather(batch["labels"]).cpu().numpy())
-        preds.append(accelerator.gather(precompute_logits(output)).cpu().numpy())
+        preds.append(accelerator.gather(pre_compute_probs_val(probs)).cpu().numpy())
         log_labels.append(accelerator.gather(batch["log_labels"]).cpu().numpy())
         # dist.append(accelerator.gather(outputs.dist).cpu().numpy())
 
