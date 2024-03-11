@@ -1091,7 +1091,7 @@ def main():
         #         step=completed_steps,
         #     )
 
-        if avg_acc > best_val_acc:
+        if avg_acc >= best_val_acc:
             best_val_acc = avg_acc
             best_model_dir = f"epoch_{epoch}"
             # radius = get_radius(total_dist, args.nu)
@@ -1149,8 +1149,8 @@ def main():
 
     accelerator.wait_for_everyone()
     logger.info("*** Test ***")
-    logger.info("Loading best checkpoint from: %s", os.path.join(args.output_dir, best_model_dir))
-    accelerator.load_state(os.path.join(args.output_dir, best_model_dir))
+    # logger.info("Loading best checkpoint from: %s", os.path.join(args.output_dir, best_model_dir))
+    # accelerator.load_state(os.path.join(args.output_dir, best_model_dir))
     # logger.info("Loading best attributes from: %s", os.path.join(args.output_dir, "best_attributes.pth"))
     # rank = accelerator.process_index
     # map_location = {'cuda:%d' % 0: 'cuda:%d' % rank}
