@@ -1,6 +1,6 @@
 import os
 import pandas as pd
-from logadempirical.data.grouping import time_sliding_window, session_window, session_window_bgl, fixed_window
+from grouping import time_sliding_window, session_window, session_window_bgl, fixed_window
 import pickle
 from sklearn.utils import shuffle
 from logging import Logger
@@ -74,7 +74,7 @@ def process_dataset(logger: Logger,
                 window_size=window_size,
                 step_size=step_size
             )
-            pdb.set_trace()
+            # pdb.set_trace()
 
     elif grouping == "session":
         if dataset_name == "HDFS":
@@ -114,8 +114,13 @@ def process_dataset(logger: Logger,
 
 
 if __name__ == '__main__':
+    data = "Thunderbird"
+    if data == "HDFS":
+        group = "session"
+    else:
+        group = "sliding"
     process_dataset(Logger("BGL"),
-                    data_dir="../../dataset/", output_dir="../../dataset/", log_file="BGL.log",
-                    dataset_name="bgl",
-                    grouping="sliding", window_size=10, step_size=10, train_size=0.8, is_chronological=True,
+                    data_dir="../../dataset/"+data, output_dir="../../dataset/"+data, log_file=data+".log",
+                    dataset_name=data,
+                    grouping=group, window_size=20, step_size=20, train_size=0.8, is_chronological=True,
                     session_type="entry")

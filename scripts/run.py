@@ -1,26 +1,5 @@
 #!/usr/bin/env python
 # coding=utf-8
-# Copyright 2021 The HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""
-Fine-tuning the library models for masked language modeling (BERT, ALBERT, RoBERTa...)
-on a text file or a dataset without using HuggingFace Trainer.
-
-Here is the full list of checkpoints on the hub that can be fine-tuned by this script:
-https://huggingface.co/models?filter=fill-mask
-"""
-# You can also adapt this script on your own mlm task. Pointers for this are left as comments.
 import argparse
 import json
 import logging
@@ -30,6 +9,8 @@ import random
 from itertools import chain
 from pathlib import Path
 import shutil
+import pickle
+import pandas as pd
 
 import datasets
 import torch
@@ -42,6 +23,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 import torch.nn as nn
 import torch.nn.functional as F
+from model import model
 
 import transformers
 from transformers import (
@@ -59,7 +41,6 @@ from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
 from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score
 import numpy as np
-from model import model
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -74,29 +55,20 @@ MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a Masked Language Modeling task")
     parser.add_argument(
-        "--dataset_name",
+        "--train_path",
         type=str,
-        default=None,
-        help="The name of the dataset to use (via the datasets library).",
+        required=True,
+        help="Path to the training dataset",
     )
     parser.add_argument(
-        "--dataset_config_name",
+        "--test_path",
         type=str,
-        default=None,
-        help="The configuration name of the dataset to use (via the datasets library).",
-    )
-    parser.add_argument(
-        "--train_file", type=str, default=None, help="A csv or a json file containing the training data."
-    )
-    parser.add_argument(
-        "--validation_file", type=str, default=None, help="A csv or a json file containing the validation data."
-    )
-    parser.add_argument(
-        "--test_file", type=str, default=None, help="A csv or a json file containing the test data."
+        required=True,
+        help="Path to the test dataset",
     )
     parser.add_argument(
         "--validation_split_percentage",
-        default=5,
+        default=10,
         help="The percentage of the train set used as validation set in case there's no validation split",
     )
     parser.add_argument(
@@ -204,11 +176,6 @@ def parse_args():
     parser.add_argument(
         "--mlm_probability", type=float, default=0.15, help="Ratio of tokens to mask for masked language modeling loss"
     )
-    parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
-    parser.add_argument(
-        "--hub_model_id", type=str, help="The name of the repository to keep in sync with the local `output_dir`."
-    )
-    parser.add_argument("--hub_token", type=str, help="The token to use to push to the Model Hub.")
     parser.add_argument(
         "--trust_remote_code",
         type=bool,
@@ -298,32 +265,11 @@ def parse_args():
     )
     args = parser.parse_args()
 
-    # Sanity checks
-    if args.dataset_name is None and args.train_file is None and args.validation_file is None:
-        raise ValueError("Need either a dataset name or a training/validation file.")
-    else:
-        if args.train_file is not None:
-            extension = args.train_file.split(".")[-1]
-            if extension not in ["csv", "json", "txt"]:
-                raise ValueError("`train_file` should be a csv, json or txt file.")
-        if args.validation_file is not None:
-            extension = args.validation_file.split(".")[-1]
-            if extension not in ["csv", "json", "txt"]:
-                raise ValueError("`validation_file` should be a csv, json or txt file.")
-
-    if args.push_to_hub:
-        if args.output_dir is None:
-            raise ValueError("Need an `output_dir` to create a repo when `--push_to_hub` is passed.")
-
     return args
 
 
 def main():
     args = parse_args()
-
-    # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
-    # information sent is the one passed as arguments along with your Python/PyTorch versions.
-    send_example_telemetry("run_mlm_no_trainer", args)
 
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
     # If we're using tracking, we also need to initialize it here and it will by default pick up all supported trackers
@@ -356,76 +302,38 @@ def main():
 
     # Handle the repository creation
     if accelerator.is_main_process:
-        if args.push_to_hub:
-            # Retrieve of infer repo_name
-            repo_name = args.hub_model_id
-            if repo_name is None:
-                repo_name = Path(args.output_dir).absolute().name
-            # Create repo and retrieve repo_id
-            repo_id = create_repo(repo_name, exist_ok=True, token=args.hub_token).repo_id
-            # Clone repo locally
-            repo = Repository(args.output_dir, clone_from=repo_id, token=args.hub_token)
-
-            with open(os.path.join(args.output_dir, ".gitignore"), "w+") as gitignore:
-                if "step_*" not in gitignore:
-                    gitignore.write("step_*\n")
-                if "epoch_*" not in gitignore:
-                    gitignore.write("epoch_*\n")
-        elif args.output_dir is not None:
+        if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
     accelerator.wait_for_everyone()
 
-    # Get the datasets: you can either provide your own CSV/JSON/TXT training and evaluation files (see below)
-    # or just provide the name of one of the public datasets available on the hub at https://huggingface.co/datasets/
-    # (the dataset will be downloaded automatically from the datasets Hub).
-    #
-    # For CSV/JSON files, this script will use the column called 'text' or the first column if no column called
-    # 'text' is found. You can easily tweak this behavior (see below).
-    #
     # In distributed training, the load_dataset function guarantee that only one local process can concurrently
     # download the dataset.
-    if args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        raw_datasets = load_dataset(args.dataset_name, args.dataset_config_name)
-        if "validation" not in raw_datasets.keys():
-            raw_datasets["validation"] = load_dataset(
-                args.dataset_name,
-                args.dataset_config_name,
-                split=f"train[:{args.validation_split_percentage}%]",
-            )
-            raw_datasets["train"] = load_dataset(
-                args.dataset_name,
-                args.dataset_config_name,
-                split=f"train[{args.validation_split_percentage}%:]",
-            )
-    else:
-        data_files = {}
-        if args.train_file is not None:
-            data_files["train"] = args.train_file
-        if args.validation_file is not None:
-            data_files["validation"] = args.validation_file
-        if args.test_file is not None:
-            data_files["test"] = args.test_file
-        extension = args.train_file.split(".")[-1]
-        if extension == "txt":
-            extension = "text"
-        raw_datasets = load_dataset(extension, data_files=data_files)
-        # If no validation data is there, validation_split_percentage will be used to divide the dataset.
-        if "validation" not in raw_datasets.keys():
-            raw_datasets["validation"] = load_dataset(
-                extension,
-                data_files=data_files,
-                split=f"train[:{args.validation_split_percentage}%]",
-            )
-            raw_datasets["train"] = load_dataset(
-                extension,
-                data_files=data_files,
-                split=f"train[{args.validation_split_percentage}%:]",
-            )
-
-    # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
-    # https://huggingface.co/docs/datasets/loading_datasets.
-
+    if args.train_path is not None:
+        with open(args.train_path, "rb") as f:
+            train_data = pickle.load(f)
+            train_df = pd.DataFrame(train_data)
+            # Check if 'label' column contains lists
+            if train_df['Label'].apply(isinstance, args=(list,)).all():
+                # Find the max of each list in the 'label' column
+                train_df['Label'] = train_df['Label'].apply(max)
+            train_df['EventTemplate'] = train_df['EventTemplate'].apply(lambda x: ' '.join([i.replace('<*>', '') for i in x]))
+    if args.test_path is not None:
+        with open(args.test_path, "rb") as f:
+            test_data = pickle.load(f)
+            test_df = pd.DataFrame(test_data)
+            # Check if 'label' column contains lists
+            if test_df['Label'].apply(isinstance, args=(list,)).all():
+                # Find the max of each list in the 'label' column
+                test_df['Label'] = test_df['Label'].apply(max)
+            test_df['EventTemplate'] = test_df['EventTemplate'].apply(lambda x: ' '.join([i.replace('<*>', '') for i in x]))
+    
+    # Load the dataset
+    raw_datasets = datasets.Dataset.from_pandas(train_df).train_test_split(
+        test_size=args.validation_split_percentage / 100
+    )
+    raw_datasets["validation"] = raw_datasets["test"]
+    raw_datasets["test"] = datasets.Dataset.from_pandas(test_df)
+        
     # Load pretrained model and tokenizer
     #
     # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
@@ -490,7 +398,7 @@ def main():
     # Preprocessing the datasets.
     # First we tokenize all the texts.
     column_names = raw_datasets["train"].column_names
-    text_column_name = "text" if "text" in column_names else column_names[0]
+    text_column_name = "EventTemplate" if "EventTemplate" in column_names else column_names[0]
 
     if args.max_seq_length is None:
         max_seq_length = tokenizer.model_max_length
@@ -523,7 +431,7 @@ def main():
                 # receives the `special_tokens_mask`.
                 return_special_tokens_mask=False,
             )
-            batch['log_labels'] = examples['labels']
+            batch['log_labels'] = examples['Label']
             return batch
 
         # def tokenize_function(examples):
@@ -742,7 +650,8 @@ def main():
 
     # Data collator
     # This one will take care of randomly masking the tokens.
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=args.mlm_probability)
+    # data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=args.mlm_probability)
+    data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
     # DataLoaders creation:
     train_dataloader = DataLoader(
