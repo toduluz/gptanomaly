@@ -7,9 +7,9 @@ export PYTHONPATH="${PYTHONPATH}:./"
 accelerate launch --main_process_port $main_process_port scripts/run.py \
     --train_path ../dataset/${DATASET_NAME}/train.pkl \
     --test_path ../dataset/${DATASET_NAME}/test.pkl \
-    --per_device_train_batch_size 128 \
-    --per_device_eval_batch_size 128 \
-    --num_train_epochs 100 \
+    --per_device_train_batch_size 8 \
+    --per_device_eval_batch_size 8 \
+    --num_train_epochs 10 \
     --output_dir outputs/${DATASET_NAME} \
     --model_name_or_path ./model \
     --trust_remote_code true \
@@ -20,6 +20,7 @@ accelerate launch --main_process_port $main_process_port scripts/run.py \
     --preprocessing_num_workers 1 \
     --mlm_probability 0.15 \
     --early_stopping_patience 100 \
+    --normal_only true \
     --encoder_name_or_path roberta-base \
     --max_train_samples ${NUM_SAMPLES} \
     --max_eval_samples ${NUM_SAMPLES} \

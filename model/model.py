@@ -1,60 +1,48 @@
 import torch
 from torch import nn
 
+
+#------------------------------
+#   The Generator as in 
+#   https://www.aclweb.org/anthology/2020.acl-main.191/
+#   https://github.com/crux82/ganbert
+#------------------------------
 class Generator(nn.Module):
-    def __init__(self, hidden_size: int = 768):
+    def __init__(self, noise_size=100, output_size=768, hidden_sizes=[768], dropout_rate=0.1):
         super().__init__()
-        # Building an linear encoder with Linear
-        self.hidden_size = hidden_size
-        self.encoder = nn.Sequential(
-            nn.Linear(self.hidden_size, self.hidden_size//2),
-            nn.LeakyReLU(),
-            nn.Linear(self.hidden_size//2, self.hidden_size//4),
-            nn.LeakyReLU(),
-            nn.Linear(self.hidden_size//4, self.hidden_size//8),
-            nn.LeakyReLU(),
-            nn.Linear(self.hidden_size//8, self.hidden_size//16),
-            nn.LeakyReLU(),
-            nn.Linear(self.hidden_size//16, self.hidden_size//32),
-            nn.LeakyReLU(),
-            nn.Linear(self.hidden_size//32, self.hidden_size//64)
-        )
-         
-        # Building an linear decoder with Linear
-        self.decoder = nn.Sequential(
-            nn.Linear(self.hidden_size//64, self.hidden_size//32),
-            nn.LeakyReLU(),
-            nn.Linear(self.hidden_size//32, self.hidden_size//16),
-            nn.LeakyReLU(),
-            nn.Linear(self.hidden_size//16, self.hidden_size//8),
-            nn.LeakyReLU(),
-            nn.Linear(self.hidden_size//8, self.hidden_size//4),
-            nn.LeakyReLU(),
-            nn.Linear(self.hidden_size//4, self.hidden_size//2),
-            nn.LeakyReLU(),
-            nn.Linear(self.hidden_size//2, self.hidden_size)
-        )
- 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        encoded = self.encoder(x)
-        decoded = self.decoder(encoded)
-        return decoded
+        layers = []
+        hidden_sizes = [noise_size] + hidden_sizes
+        for i in range(len(hidden_sizes)-1):
+            layers.extend([nn.Linear(hidden_sizes[i], hidden_sizes[i+1]), nn.LeakyReLU(0.2, inplace=True), nn.Dropout(dropout_rate)])
 
-class LSTMDiscriminator(nn.Module):
-    def __init__(self,hidden_size: int = 384):
+        layers.append(nn.Linear(hidden_sizes[-1],output_size))
+        self.layers = nn.Sequential(*layers)
 
+    def forward(self, noise):
+        output_rep = self.layers(noise)
+        return output_rep
+
+#------------------------------
+#   The Discriminator
+#   https://www.aclweb.org/anthology/2020.acl-main.191/
+#   https://github.com/crux82/ganbert
+#------------------------------
+class Discriminator(nn.Module):
+    def __init__(self, input_size=768, hidden_sizes=[768], num_labels=1, dropout_rate=0.1):
         super().__init__()
-        self.lstm = nn.LSTM(input_size=768, hidden_size=hidden_size, num_layers=2, batch_first=True)
-        self.mlp = nn.Linear(hidden_size,2)
-        self.activation = nn.LeakyReLU()
+        self.input_dropout = nn.Dropout(p=dropout_rate)
+        layers = []
+        hidden_sizes = [input_size] + hidden_sizes
+        for i in range(len(hidden_sizes)-1):
+            layers.extend([nn.Linear(hidden_sizes[i], hidden_sizes[i+1]), nn.LeakyReLU(0.2, inplace=True), nn.Dropout(dropout_rate)])
+
+        self.layers = nn.Sequential(*layers) #per il flatten
+        self.logit = nn.Linear(hidden_sizes[-1],num_labels+1) # +1 for the probability of this sample being fake/real.
         self.softmax = nn.Softmax(dim=-1)
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        
-        features_encoded,_ = self.lstm(inputs)
-        # get last ouput of lstm encoder
-        features_encoded = features_encoded[:,-1,:]
-        out = self.mlp(features_encoded)
-        logits = self.activation(out)
+    def forward(self, input_rep):
+        input_rep = self.input_dropout(input_rep)
+        last_rep = self.layers(input_rep)
+        logits = self.logit(last_rep)
         probs = self.softmax(logits)
-        return logits, probs
+        return last_rep, logits, probs

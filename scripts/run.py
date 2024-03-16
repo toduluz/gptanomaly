@@ -263,6 +263,12 @@ def parse_args():
         default=None,
         help="The name or path of the encoder model to use.",
     )
+    parser.add_argument(
+        "--normal_only",
+        type=bool,
+        default=True,
+        help="If passed, will only use normal samples for training and testing.",
+    )
     args = parser.parse_args()
 
     return args
@@ -317,6 +323,8 @@ def main():
                 # Find the max of each list in the 'label' column
                 train_df['Label'] = train_df['Label'].apply(max)
             train_df['EventTemplate'] = train_df['EventTemplate'].apply(lambda x: ' '.join([i.replace('<*>', '') for i in x]))
+            if args.normal_only:
+                train_df = train_df[train_df['Label'] == 0].reset_index(drop=True)
     if args.test_path is not None:
         with open(args.test_path, "rb") as f:
             test_data = pickle.load(f)
@@ -378,7 +386,7 @@ def main():
     #     model = AutoModel.from_config(config, trust_remote_code=args.trust_remote_code)
 
     generator_model = model.Generator()
-    discriminator_model = model.LSTMDiscriminator()
+    discriminator_model = model.Discriminator()
     
     if args.encoder_name_or_path:
         encoder = AutoModel.from_pretrained(
@@ -508,6 +516,7 @@ def main():
             )
 
     def pre_compute_probs_val(d_probs):
+        d_probs = d_probs[:, 0, :]
         result = torch.argmax(d_probs, dim=-1)
         return result
 
@@ -662,19 +671,25 @@ def main():
 
     # Optimizer
     # Split weights in two groups, one with weight decay and the other not.
-    # no_decay = ["bias", "LayerNorm.weight"]
-    # optimizer_grouped_parameters = [
-    #     {
-    #         "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-    #         "weight_decay": args.weight_decay,
-    #     },
-    #     {
-    #         "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
-    #         "weight_decay": 0.0,
-    #     },
-    # ]
+    no_decay = ["bias", "LayerNorm.weight"]
+    optimizer_grouped_parameters = [
+        {
+            "params": [p for n, p in encoder.named_parameters() if not any(nd in n for nd in no_decay)],
+            "weight_decay": args.weight_decay,
+        },
+        {
+            "params": [p for n, p in encoder.named_parameters() if any(nd in n for nd in no_decay)],
+            "weight_decay": 0.0,
+        },
+    ]
+    discriminator_parameters = optimizer_grouped_parameters + [
+        {
+            "params": discriminator_model.parameters(),
+            "weight_decay": args.weight_decay,
+        }
+    ]
     g_optimizer = torch.optim.AdamW(generator_model.parameters(), lr=args.learning_rate)
-    d_optimizer = torch.optim.AdamW(discriminator_model.parameters(), lr=args.learning_rate)
+    d_optimizer = torch.optim.AdamW(discriminator_parameters, lr=args.learning_rate)
 
     # Note -> the training dataloader needs to be prepared before we grab his length below (cause its length will be
     # shorter in multiprocess)
@@ -781,10 +796,21 @@ def main():
     # update the progress_bar if load from checkpoint
     progress_bar.update(completed_steps)
 
-    best_val_acc = 0
-    best_model_dir = None
-    epochs_no_improve = 0
+    # best_val_acc = 0
+    # best_model_dir = None
+    # epochs_no_improve = 0
     epsilon = 1e-8
+    noise_size = 100 
+
+    # Freeze first 50% of encoder
+    count = 0
+    for param in encoder.parameters():
+        if count < 0:
+            param.requires_grad = False
+        count += 1
+    print(f"The total number of parameters: {count}")
+        
+    
 
     for epoch in range(starting_epoch, args.num_train_epochs):
         # total_dist = []
@@ -820,8 +846,7 @@ def main():
         for step, batch in enumerate(active_dataloader):
             # with accelerator.accumulate(model):
                 # if args.encoder_name_or_path:
-            with torch.no_grad():
-                encodings = encoder(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
+            encodings = encoder(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
 
                 #     outputs = model(encodings.last_hidden_state)
                 #     loss = outputs.loss
@@ -832,34 +857,40 @@ def main():
                 #     optimizer.step()
                 #     lr_scheduler.step()
                 #     optimizer.zero_grad()
-
-            fake = generator_model(encodings.last_hidden_state)
+            real_batch_size = encodings.last_hidden_state.size(0)
+            noise = torch.zeros(real_batch_size, 512, noise_size, device=accelerator.device).uniform_(0, 1)
+            fake = generator_model(noise)
             discriminator_input = torch.cat([encodings.last_hidden_state, fake], dim=0)
-            logits, prob = discriminator_model(discriminator_input)
-            batch_size = encodings.last_hidden_state.size(0)
-            logits_list = torch.split(logits, batch_size)
-            d_real_logits = logits_list[0]
-            d_fake_logits = logits_list[1]
+            features, logits, probs = discriminator_model(discriminator_input)
 
-            prob_list = torch.split(prob, batch_size)
-            d_real_probs = prob_list[0]
-            d_fake_probs = prob_list[1]
+            features_list = torch.split(features, real_batch_size)
+            D_real_features = features_list[0]
+            D_fake_features = features_list[1]
+
+            logits_list = torch.split(logits, real_batch_size)
+            D_real_logits = logits_list[0]
+            D_fake_logits = logits_list[1]
+
+            prob_list = torch.split(probs, real_batch_size)
+            D_real_probs = prob_list[0]
+            D_fake_probs = prob_list[1]
 
             #---------------------------------
             #  LOSS evaluation
             #---------------------------------
             # Generator's LOSS estimation
-            g_loss_d = -1 * torch.mean(torch.log(1 - d_fake_probs[:,-1] + epsilon))
-            g_feat_reg = torch.mean(torch.pow(torch.mean(encodings.last_hidden_state, dim=0) - torch.mean(fake, dim=0), 2))
+            g_loss_d = -1 * torch.mean(torch.log(1 - D_fake_probs[:,-1] + epsilon))
+            g_feat_reg = torch.mean(torch.pow(torch.mean(D_real_features, dim=0) - torch.mean(D_fake_features, dim=0), 2))
             g_loss = g_loss_d + g_feat_reg
 
             # Disciminator's LOSS estimation
-            log_probs = F.log_softmax(d_real_logits, dim=-1)
+            logits = D_real_logits[:,0,:]
+            log_probs = F.log_softmax(D_real_logits, dim=-1)
             per_example_loss = -torch.sum(log_probs, dim=-1)
-            D_L_Supervised = torch.div(torch.sum(per_example_loss), batch_size)
+            D_L_Supervised = torch.div(torch.sum(per_example_loss), real_batch_size)
                     
-            D_L_unsupervised1U = -1 * torch.mean(torch.log(1 - d_real_probs[:, -1] + epsilon))
-            D_L_unsupervised2U = -1 * torch.mean(torch.log(d_fake_probs[:, -1] + epsilon))
+            D_L_unsupervised1U = -1 * torch.mean(torch.log(1 - D_real_probs[:, -1] + epsilon))
+            D_L_unsupervised2U = -1 * torch.mean(torch.log(D_fake_probs[:, -1] + epsilon))
             d_loss = D_L_Supervised + D_L_unsupervised1U + D_L_unsupervised2U
 
             #---------------------------------
@@ -914,66 +945,6 @@ def main():
         total_d_loss = torch.mean(d_losses)
         logger.info(f"epoch: {epoch} g_loss: {total_g_loss} d_loss: {total_d_loss}")
 
-        encoder.eval()
-        generator_model.eval()
-        discriminator_model.eval()
-        d_losses = []
-        g_losses = []
-        real_preds = []
-        fake_preds = []
-        for step, batch in enumerate(eval_dataloader):
-            with torch.no_grad():
-                encodings = encoder(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
-                fake = generator_model(encodings.last_hidden_state)
-                discriminator_input = torch.cat([encodings.last_hidden_state, fake], dim=0)
-                logits, probs = discriminator_model(discriminator_input)
-                batch_size = encodings.last_hidden_state.size(0)
-                logits_list = torch.split(logits, batch_size)
-                d_real_logits = logits_list[0]
-                d_fake_logits = logits_list[1]
-
-                prob_list = torch.split(probs, batch_size)
-                d_real_probs = prob_list[0]
-                d_fake_probs = prob_list[1]
-
-                #---------------------------------
-                #  LOSS evaluation
-                #---------------------------------
-                # Generator's LOSS estimation
-                g_loss_d = -1 * torch.mean(torch.log(1 - d_fake_probs[:,-1] + epsilon))
-                g_feat_reg = torch.mean(torch.pow(torch.mean(encodings.last_hidden_state, dim=0) - torch.mean(fake, dim=0), 2))
-                g_loss = g_loss_d + g_feat_reg
-
-                # Disciminator's LOSS estimation
-                log_probs = F.log_softmax(d_real_logits, dim=-1)
-                per_example_loss = -torch.sum(log_probs, dim=-1)
-                D_L_Supervised = torch.div(torch.sum(per_example_loss), batch_size)
-
-                D_L_unsupervised1U = -1 * torch.mean(torch.log(1 - d_real_probs[:, -1] + epsilon))
-                D_L_unsupervised2U = -1 * torch.mean(torch.log(d_fake_probs[:, -1] + epsilon))
-                d_loss = D_L_Supervised + D_L_unsupervised1U + D_L_unsupervised2U
-
-                # Save the losses to print them later
-                d_losses.append(accelerator.gather_for_metrics(d_loss.repeat(args.per_device_eval_batch_size)))
-                g_losses.append(accelerator.gather_for_metrics(g_loss.repeat(args.per_device_eval_batch_size)))
-
-                # Save the preds
-                real_preds.append(accelerator.gather(pre_compute_probs_val(d_real_probs)).cpu().numpy())
-                fake_preds.append(accelerator.gather(pre_compute_probs_val(d_fake_probs)).cpu().numpy())
-
-        d_losses = torch.cat(d_losses)
-        g_losses = torch.cat(g_losses)
-        total_g_loss = torch.mean(g_losses)
-        total_d_loss = torch.mean(d_losses)
-
-        real_preds = np.concatenate(real_preds)
-        fake_preds = np.concatenate(fake_preds)
-        # Calculate number of 0
-        real_preds_acc = np.sum(real_preds == 0) / len(real_preds)
-        fake_preds_acc = np.sum(fake_preds == 1) / len(fake_preds)
-        avg_acc = (real_preds_acc + fake_preds_acc) / 2
-        logger.info(f"epoch: {epoch} eval_g_loss: {total_g_loss} eval_d_loss: {total_d_loss} accuracy: {avg_acc}")
-
         #     losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
 
         #     # total_dist += accelerator.gather(outputs.dist).cpu().tolist()
@@ -1000,9 +971,9 @@ def main():
         #         step=completed_steps,
         #     )
 
-        if avg_acc >= best_val_acc:
-            best_val_acc = avg_acc
-            best_model_dir = f"epoch_{epoch}"
+        # if avg_acc >= best_val_acc:
+        #     best_val_acc = avg_acc
+        #     best_model_dir = f"epoch_{epoch}"
             # radius = get_radius(total_dist, args.nu)
 
             # if accelerator.is_main_process:
@@ -1015,9 +986,9 @@ def main():
             #             'best_radius': radius
             #         }, output_dir)
 
-            epochs_no_improve = 0
-        else:
-            epochs_no_improve += 1
+        #     epochs_no_improve = 0
+        # else:
+        #     epochs_no_improve += 1
         
         # if args.push_to_hub and epoch < args.num_train_epochs - 1:
         #     accelerator.wait_for_everyone()
@@ -1039,7 +1010,7 @@ def main():
         
         if accelerator.is_main_process:
             # Get a list of all directories in the parent directory
-            all_dirs_exclude_best = [str(pth) for pth in Path(args.output_dir).iterdir() if pth.is_dir() and os.path.basename(pth) != best_model_dir]
+            all_dirs_exclude_best = [str(pth) for pth in Path(args.output_dir).iterdir() if pth.is_dir()]# and os.path.basename(pth) != best_model_dir]
 
             # Sort the directories by modification time (latest first)
             all_dirs_exclude_best.sort(key=os.path.getmtime, reverse=True)
@@ -1052,9 +1023,9 @@ def main():
                     if dir not in dirs_to_keep:
                         shutil.rmtree(dir)
         
-        if args.early_stopping_patience is not None and epochs_no_improve > args.early_stopping_patience:
-            logger.info(f"Early stopping at epoch {epoch}")
-            break
+        # if args.early_stopping_patience is not None and epochs_no_improve > args.early_stopping_patience:
+        #     logger.info(f"Early stopping at epoch {epoch}")
+        #     break
 
     accelerator.wait_for_everyone()
     logger.info("*** Test ***")
@@ -1081,7 +1052,7 @@ def main():
     for steps, batch in enumerate(test_dataloader):
         with torch.no_grad():
             encodings = encoder(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
-            logits, probs = discriminator_model(encodings.last_hidden_state)
+            features, logits, probs = discriminator_model(encodings.last_hidden_state)
 
         # mlm_preds.append(accelerator.gather(precompute_logits(outputs.mlm_logits, k=5)).cpu().numpy())
         # mlm_labels.append(accelerator.gather(batch["labels"]).cpu().numpy())
