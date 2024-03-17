@@ -671,25 +671,25 @@ def main():
 
     # Optimizer
     # Split weights in two groups, one with weight decay and the other not.
-    no_decay = ["bias", "LayerNorm.weight"]
-    optimizer_grouped_parameters = [
-        {
-            "params": [p for n, p in encoder.named_parameters() if not any(nd in n for nd in no_decay)],
-            "weight_decay": args.weight_decay,
-        },
-        {
-            "params": [p for n, p in encoder.named_parameters() if any(nd in n for nd in no_decay)],
-            "weight_decay": 0.0,
-        },
-    ]
-    discriminator_parameters = optimizer_grouped_parameters + [
-        {
-            "params": discriminator_model.parameters(),
-            "weight_decay": args.weight_decay,
-        }
-    ]
+    # no_decay = ["bias", "LayerNorm.weight"]
+    # optimizer_grouped_parameters = [
+    #     {
+    #         "params": [p for n, p in encoder.named_parameters() if not any(nd in n for nd in no_decay)],
+    #         "weight_decay": args.weight_decay,
+    #     },
+    #     {
+    #         "params": [p for n, p in encoder.named_parameters() if any(nd in n for nd in no_decay)],
+    #         "weight_decay": 0.0,
+    #     },
+    # ]
+    # discriminator_parameters = optimizer_grouped_parameters + [
+    #     {
+    #         "params": discriminator_model.parameters(),
+    #         "weight_decay": args.weight_decay,
+    #     }
+    # ]
     g_optimizer = torch.optim.AdamW(generator_model.parameters(), lr=args.learning_rate)
-    d_optimizer = torch.optim.AdamW(discriminator_parameters, lr=args.learning_rate)
+    d_optimizer = torch.optim.AdamW(discriminator_model.parameters(), lr=args.learning_rate)
 
     # Note -> the training dataloader needs to be prepared before we grab his length below (cause its length will be
     # shorter in multiprocess)
@@ -846,7 +846,8 @@ def main():
         for step, batch in enumerate(active_dataloader):
             # with accelerator.accumulate(model):
                 # if args.encoder_name_or_path:
-            encodings = encoder(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
+            with torch.no_grad():
+                encodings = encoder(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
 
                 #     outputs = model(encodings.last_hidden_state)
                 #     loss = outputs.loss
@@ -858,7 +859,8 @@ def main():
                 #     lr_scheduler.step()
                 #     optimizer.zero_grad()
             real_batch_size = encodings.last_hidden_state.size(0)
-            noise = torch.zeros(real_batch_size, 512, noise_size, device=accelerator.device).uniform_(0, 1)
+            num_seq = encodings.last_hidden_state.size(1)
+            noise = torch.zeros(real_batch_size, num_seq, noise_size, device=accelerator.device).uniform_(0, 1)
             fake = generator_model(noise)
             discriminator_input = torch.cat([encodings.last_hidden_state, fake], dim=0)
             features, logits, probs = discriminator_model(discriminator_input)
