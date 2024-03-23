@@ -2,14 +2,14 @@ DATASET_NAME=HDFS
 main_process_port=$(( $RANDOM % 10 + 29500 ))
 echo "Main process port: $main_process_port"
 
-NUM_SAMPLES=5000
+NUM_SAMPLES=50
 TRANSFORMER=roberta-base
 export PYTHONPATH="${PYTHONPATH}:./"
 accelerate launch --main_process_port $main_process_port scripts/run.py \
     --train_path ../dataset/${DATASET_NAME}/train.pkl \
     --test_path ../dataset/${DATASET_NAME}/test.pkl \
-    --per_device_train_batch_size 128 \
-    --per_device_eval_batch_size 128 \
+    --per_device_train_batch_size 32 \
+    --per_device_eval_batch_size 32 \
     --num_train_epochs 10 \
     --output_dir outputs/${DATASET_NAME} \
     --model_name_or_path ./model \

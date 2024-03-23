@@ -1,48 +1,94 @@
+from transformers.models.roberta.modeling_roberta import RobertaConfig, RobertaPreTrainedModel, RobertaLMHead, RobertaEmbeddings
+from transformers.modeling_outputs import MaskedLMOutput
+from dataclasses import dataclass
+from transformers.modeling_outputs import ModelOutput
+
 import torch
 from torch import nn
+from torch.nn import CrossEntropyLoss, MSELoss
+from typing import Optional, Tuple, Union
 
+@dataclass
+class LogRobertAEOutput(ModelOutput):
 
-#------------------------------
-#   The Generator as in 
-#   https://www.aclweb.org/anthology/2020.acl-main.191/
-#   https://github.com/crux82/ganbert
-#------------------------------
-class Generator(nn.Module):
-    def __init__(self, noise_size=100, output_size=768, hidden_sizes=[768], dropout_rate=0.1):
+    loss: Optional[torch.FloatTensor] = None
+    logits: torch.FloatTensor = None
+    secondary_logits: torch.FloatTensor = None
+
+class LogRobertaAEConfig(RobertaConfig):
+    def __init__(
+        self,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+
+class LanguageModelAutoencoder(nn.Module):
+    def __init__(self, hidden_size, latent_size):
         super().__init__()
-        layers = []
-        hidden_sizes = [noise_size] + hidden_sizes
-        for i in range(len(hidden_sizes)-1):
-            layers.extend([nn.Linear(hidden_sizes[i], hidden_sizes[i+1]), nn.LeakyReLU(0.2, inplace=True), nn.Dropout(dropout_rate)])
 
-        layers.append(nn.Linear(hidden_sizes[-1],output_size))
-        self.layers = nn.Sequential(*layers)
+        # Map the encoder output to the latent space
+        self.latent = nn.Linear(hidden_size, latent_size)
 
-    def forward(self, noise):
-        output_rep = self.layers(noise)
-        return output_rep
+        # Map the latent representation back to the hidden size
+        self.expand = nn.Linear(latent_size, hidden_size)
 
-#------------------------------
-#   The Discriminator
-#   https://www.aclweb.org/anthology/2020.acl-main.191/
-#   https://github.com/crux82/ganbert
-#------------------------------
-class Discriminator(nn.Module):
-    def __init__(self, input_size=768, hidden_sizes=[768], num_labels=1, dropout_rate=0.1):
-        super().__init__()
-        self.input_dropout = nn.Dropout(p=dropout_rate)
-        layers = []
-        hidden_sizes = [input_size] + hidden_sizes
-        for i in range(len(hidden_sizes)-1):
-            layers.extend([nn.Linear(hidden_sizes[i], hidden_sizes[i+1]), nn.LeakyReLU(0.2, inplace=True), nn.Dropout(dropout_rate)])
+    def forward(self, x):
+        # Compute the latent representation
+        latent_representation = self.latent(x)
 
-        self.layers = nn.Sequential(*layers) #per il flatten
-        self.logit = nn.Linear(hidden_sizes[-1],num_labels+1) # +1 for the probability of this sample being fake/real.
-        self.softmax = nn.Softmax(dim=-1)
+        # Expand the latent representation
+        expanded_representation = self.expand(latent_representation)
 
-    def forward(self, input_rep):
-        input_rep = self.input_dropout(input_rep)
-        last_rep = self.layers(input_rep)
-        logits = self.logit(last_rep)
-        probs = self.softmax(logits)
-        return last_rep, logits, probs
+        return expanded_representation
+
+class LogRobertaAEModelForMaskedLM(RobertaPreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.config = config
+        self.lm_head = RobertaLMHead(config)
+        self.ae = LanguageModelAutoencoder(config.hidden_size, config.hidden_size//4)
+
+        self.embeddings = RobertaEmbeddings(config)
+
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.embeddings.word_embeddings
+
+    def set_input_embeddings(self, value):
+        self.embeddings.word_embeddings = value
+
+    def get_output_embeddings(self):
+        return self.lm_head.decoder
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head.decoder = new_embeddings
+
+    def forward(self, x, labels=None):
+    
+        ae_output = self.ae(x)
+        prediction_scores = self.lm_head(ae_output)
+
+        # Compute the autoencoder loss
+        loss_fct_ae = MSELoss()
+        ae_loss = loss_fct_ae(ae_output[:, 0, :].reshape(-1, self.config.hidden_size), x[:, 0, :].reshape(-1, self.config.hidden_size))
+
+        masked_lm_loss = None
+        if labels is not None:
+            # move labels to correct device to enable model parallelism
+            labels = labels.to(prediction_scores.device)
+            loss_fct = CrossEntropyLoss()
+            masked_lm_loss = loss_fct(prediction_scores.view(-1, self.config.vocab_size), labels.view(-1))
+        
+        if masked_lm_loss is None:
+            total_loss = ae_loss
+        else:
+            total_loss = ae_loss + masked_lm_loss
+
+        return LogRobertAEOutput(
+            loss=total_loss,
+            logits=prediction_scores,
+            secondary_logits=ae_output[:, 0, :].reshape(-1, self.config.hidden_size)
+        )

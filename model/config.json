@@ -1,7 +1,7 @@
 {
   "auto_map": {
-    "AutoModel": "model.LogAnomalyRobertaModel",
-    "AutoConfig": "model.LogRobertaConfig"
+    "AutoModelForMaskedLM": "model.LogRobertaAEModelForMaskedLM",
+    "AutoConfig": "model.LogRobertaAEConfig"
   },
   "attention_probs_dropout_prob": 0.1,
   "bos_token_id": 0,
