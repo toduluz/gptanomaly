@@ -2,7 +2,7 @@ DATASET_NAME=HDFS
 main_process_port=$(( $RANDOM % 10 + 29500 ))
 echo "Main process port: $main_process_port"
 
-NUM_SAMPLES=50
+NUM_SAMPLES=5000
 TRANSFORMER=gpt2
 export PYTHONPATH="${PYTHONPATH}:./"
 accelerate launch --main_process_port $main_process_port scripts/run_clm_no_trainer.py \

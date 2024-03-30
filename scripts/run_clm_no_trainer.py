@@ -56,6 +56,8 @@ from transformers import (
 )
 from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
+import evaluate
+from sklearn.metrics import f1_score, precision_score, recall_score
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -278,6 +280,12 @@ def parse_args():
         default=None,
         help="For debugging purposes or quicker training, truncate the number of test examples to this value if set.",
     )
+    parser.add_argument(
+        "--per_device_test_batch_size",
+        type=int,
+        default=1,
+        help="Batch size (per device) for the test dataloader.",
+    )
     args = parser.parse_args()
 
     # Sanity checks
@@ -445,6 +453,8 @@ def main():
         raw_datasets['train'] = datasets.Dataset.from_pandas(train_df)
         raw_datasets['validation'] = datasets.Dataset.from_pandas(val_df)
 
+        test_dataset = datasets.Dataset.from_pandas(test_df)
+
     # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
     # https://huggingface.co/docs/datasets/loading_datasets.
 
@@ -580,6 +590,25 @@ def main():
     train_dataset = lm_datasets["train"]
     eval_dataset = lm_datasets["validation"]
 
+    column_names = test_dataset.column_names
+    text_column_name = "Content" if "Content" in column_names else column_names[0]
+    def truncate_sentences(examples):
+        batch = tokenizer(examples[text_column_name], truncation=True, max_length=block_size)
+        batch['log_labels'] = examples['Label']
+        batch["labels"] = batch["input_ids"].copy()
+
+        return batch
+
+    with accelerator.main_process_first():
+        test_dataset = test_dataset.map(
+            truncate_sentences,
+            batched=True,
+            num_proc=args.preprocessing_num_workers,
+             remove_columns=column_names,
+            load_from_cache_file=not args.overwrite_cache,
+            desc="Truncating sentences to block size for test_dataset",
+        )
+
     # Log a few random samples from the training set:
     for index in random.sample(range(len(train_dataset)), 3):
         logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
@@ -590,6 +619,10 @@ def main():
     )
     eval_dataloader = DataLoader(
         eval_dataset, collate_fn=default_data_collator, batch_size=args.per_device_eval_batch_size
+    )
+
+    test_dataloader = DataLoader(
+        test_dataset, collate_fn=default_data_collator, batch_size=args.per_device_test_batch_size
     )
 
     # Optimizer
@@ -624,8 +657,8 @@ def main():
     )
 
     # Prepare everything with our `accelerator`.
-    model, baseline_model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
-        model, baseline_model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
+    model, baseline_model, optimizer, train_dataloader, eval_dataloader, test_dataloader, lr_scheduler = accelerator.prepare(
+        model, baseline_model, optimizer, train_dataloader, eval_dataloader, test_dataloader, lr_scheduler
     )
 
     # On TPU, the tie weights in our model have been disconnected, so we need to restore the ties.
@@ -700,6 +733,7 @@ def main():
     progress_bar.update(completed_steps)
 
     difference = 0
+    ratio = 0
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
         if args.with_tracking:
@@ -821,6 +855,50 @@ def main():
                 )
             # with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
             #     json.dump({"perplexity": perplexity}, f)
+    
+    ### Test the model ###
+    model.eval()
+    baseline_model.eval()
+    def compute_metrics(preds, labels, difference):
+
+        predictions = []
+        for p, in preds:
+            predict= 1 if p > difference else 0
+            predictions.append(predict)
+        
+        f1 = f1_score(labels, predictions)
+        precision = precision_score(labels, predictions)
+        recall = recall_score(labels, predictions)
+
+        return {
+            "f1_score": f1,
+            "precision": precision,
+            "recall": recall,
+        }
+
+    differences_test = []
+    labels = []
+    for step, batch in enumerate(test_dataloader):
+        with torch.no_grad():
+            outputs = model(batch["input_ids"], labels=batch["labels"])
+            baseline_outputs = baseline_model(batch["input_ids"], labels=batch["labels"])
+
+        loss = outputs.loss
+        baseline_loss = baseline_outputs.loss
+        
+        perplexity = math.exp(loss)
+        baseline_perplexity = math.exp(baseline_loss)
+        difference = perplexity - ratio * baseline_perplexity
+        difference_tensor = torch.full((args.per_device_test_batch_size,), difference, device=accelerator.device)
+        differences_test.append(accelerator.gather(difference_tensor))
+        labels.append(accelerator.gather(batch["log_labels"]))
+
+    # differences_test = torch.cat(differences_test).cpu().numpy()
+    labels = torch.cat(labels).cpu().numpy()
+
+    results = compute_metrics(differences_test, labels, difference)
+    logger.info(f"Test results: {results}")
+
 
 
 if __name__ == "__main__":
