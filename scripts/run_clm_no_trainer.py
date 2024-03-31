@@ -58,6 +58,7 @@ from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
 import evaluate
 from sklearn.metrics import f1_score, precision_score, recall_score
+import numpy as np
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -596,6 +597,7 @@ def main():
         batch = tokenizer(examples[text_column_name], truncation=True, max_length=block_size)
         batch['log_labels'] = examples['Label']
         batch["labels"] = batch["input_ids"].copy()
+        print(batch.keys())
 
         return batch
 
@@ -862,7 +864,7 @@ def main():
     def compute_metrics(preds, labels, difference):
 
         predictions = []
-        for p, in preds:
+        for p in preds:
             predict= 1 if p > difference else 0
             predictions.append(predict)
         
@@ -880,8 +882,8 @@ def main():
     labels = []
     for step, batch in enumerate(test_dataloader):
         with torch.no_grad():
-            outputs = model(batch["input_ids"], labels=batch["labels"])
-            baseline_outputs = baseline_model(batch["input_ids"], labels=batch["labels"])
+            outputs = model(batch["input_ids"], labels=batch["labels"], attention_mask=batch["attention_mask"])
+            baseline_outputs = baseline_model(batch["input_ids"], labels=batch["labels"], attention_mask=batch["attention_mask"])
 
         loss = outputs.loss
         baseline_loss = baseline_outputs.loss
@@ -890,11 +892,11 @@ def main():
         baseline_perplexity = math.exp(baseline_loss)
         difference = perplexity - ratio * baseline_perplexity
         difference_tensor = torch.full((args.per_device_test_batch_size,), difference, device=accelerator.device)
-        differences_test.append(accelerator.gather(difference_tensor))
-        labels.append(accelerator.gather(batch["log_labels"]))
+        differences_test.append(accelerator.gather(difference_tensor).cpu().numpy())
+        labels.append(accelerator.gather(batch["log_labels"]).cpu().numpy())
 
-    # differences_test = torch.cat(differences_test).cpu().numpy()
-    labels = torch.cat(labels).cpu().numpy()
+    differences_test = np.concatenate(differences_test)
+    labels = np.concatenate(labels)
 
     results = compute_metrics(differences_test, labels, difference)
     logger.info(f"Test results: {results}")

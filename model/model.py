@@ -73,7 +73,7 @@ class LogRobertaAEModelForMaskedLM(RobertaPreTrainedModel):
 
         # Compute the autoencoder loss
         loss_fct_ae = MSELoss()
-        ae_loss = loss_fct_ae(ae_output[:, 0, :].reshape(-1, self.config.hidden_size), x[:, 0, :].reshape(-1, self.config.hidden_size))
+        ae_loss = loss_fct_ae(ae_output.reshape(-1, self.config.hidden_size), x.reshape(-1, self.config.hidden_size))
 
         masked_lm_loss = None
         if labels is not None:

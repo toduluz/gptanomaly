@@ -16,7 +16,7 @@ import datasets
 import torch
 from accelerate import Accelerator, DistributedType
 from accelerate.logging import get_logger
-from accelerate.utils import set_seed
+from accelerate.utils import set_seed, DistributedDataParallelKwargs
 from datasets import load_dataset
 from huggingface_hub import Repository, create_repo
 from torch.utils.data import DataLoader
@@ -279,8 +279,10 @@ def main():
     if args.with_tracking:
         accelerator_log_kwargs["log_with"] = args.report_to
         accelerator_log_kwargs["project_dir"] = args.output_dir
+    
+    kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
-    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps, **accelerator_log_kwargs)
+    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps, **accelerator_log_kwargs, kwargs_handlers=[kwargs])
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -535,52 +537,52 @@ def main():
 
         # Calculate the average of each sample
         mean_of_each_sample = np.mean(secondary_logits, axis=1)
-        print(mean_of_each_sample.shape)
+        # print(mean_of_each_sample.shape)
 
         # Calculate the overall mean and standard deviation
         overall_mean = np.mean(mean_of_each_sample)
         overall_std_dev = np.std(mean_of_each_sample)
-        print(overall_mean, overall_std_dev)
+        # print(overall_mean, overall_std_dev)
 
         # Calculate the distance of each sample's mean from the overall mean
         distances = np.abs(mean_of_each_sample - overall_mean) / overall_std_dev
-        print(distances.shape)
+        # print(distances.shape)
 
         # Calculate the standard deviation of these distances
         std_dev_of_distances = np.std(distances)
         
-        return find_best_threshold(top_k_accuracies, np.linspace(0.51, 1.0), distances, std_dev_of_distances, log_labels)
+        return find_best_threshold(top_k_accuracies, np.linspace(0.51, 1.0), mean_of_each_sample, overall_std_dev, log_labels)
     
     def find_best_threshold(top_k_accuracies: list, accuracy_thresholds: np.ndarray, deviations: np.ndarray, std_dev, log_labels: np.ndarray) -> dict:
-        best_threshold = 0
+        # best_threshold = 0
         best_f1 = 0
         best_precision = 0
         best_recall = 0
         best_roc_auc = 0
-        best_d = 0
+        # best_d = 0
 
-        for threshold in accuracy_thresholds:
+        # for threshold in accuracy_thresholds:
             # Compute the predictions
-            for d in range(1, 10):
-                preds = (np.array(top_k_accuracies) < threshold) | (deviations > d * std_dev)
+        for d in range(1, 10):
+            preds = (deviations > d * std_dev)# (np.array(top_k_accuracies) < threshold) #| 
 
-                # Compute the metrics
-                f1 = f1_score(log_labels, preds)
-                precision = precision_score(log_labels, preds)
-                recall = recall_score(log_labels, preds)
-                roc_auc = roc_auc_score(log_labels, preds)
+            # Compute the metrics
+            f1 = f1_score(log_labels, preds)
+            precision = precision_score(log_labels, preds)
+            recall = recall_score(log_labels, preds)
+            roc_auc = roc_auc_score(log_labels, preds)
 
-                # Update the best metrics
-                if f1 > best_f1:
-                    best_d = d
-                    best_threshold = threshold
-                    best_f1 = f1
-                    best_precision = precision
-                    best_recall = recall
-                    best_roc_auc = roc_auc
+            # Update the best metrics
+            if f1 > best_f1:
+                best_d = d
+                # best_threshold = threshold
+                best_f1 = f1
+                best_precision = precision
+                best_recall = recall
+                best_roc_auc = roc_auc
             
         return {
-            "threshold": best_threshold,
+            # "threshold": best_threshold,
             "d": best_d,
             "f1": best_f1,
             "precision": best_precision,
@@ -684,172 +686,173 @@ def main():
         accelerator.init_trackers("mlm_no_trainer", experiment_config)
 
     # Train!
-    total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+    # total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
-    logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Num Epochs = {args.num_train_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
-    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-    logger.info(f"  Total optimization steps = {args.max_train_steps}")
-    # Only show the progress bar once on each machine.
-    progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
-    completed_steps = 0
-    starting_epoch = 0
+    # logger.info("***** Running training *****")
+    # logger.info(f"  Num examples = {len(train_dataset)}")
+    # logger.info(f"  Num Epochs = {args.num_train_epochs}")
+    # logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
+    # logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    # logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+    # logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    # # Only show the progress bar once on each machine.
+    # progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
+    # completed_steps = 0
+    # starting_epoch = 0
 
-    # Potentially load in the weights and states from a previous save
-    if args.resume_from_checkpoint:
-        if args.resume_from_checkpoint is not None or args.resume_from_checkpoint != "":
-            checkpoint_path = args.resume_from_checkpoint
-            path = os.path.basename(args.resume_from_checkpoint)
-        else:
-            # Get the most recent checkpoint
-            dirs = [f.name for f in os.scandir(os.getcwd()) if f.is_dir()]
-            dirs.sort(key=os.path.getctime)
-            path = dirs[-1]  # Sorts folders by date modified, most recent checkpoint is the last
-            checkpoint_path = path
-            path = os.path.basename(checkpoint_path)
+    # # Potentially load in the weights and states from a previous save
+    # if args.resume_from_checkpoint:
+    #     if args.resume_from_checkpoint is not None or args.resume_from_checkpoint != "":
+    #         checkpoint_path = args.resume_from_checkpoint
+    #         path = os.path.basename(args.resume_from_checkpoint)
+    #     else:
+    #         # Get the most recent checkpoint
+    #         dirs = [f.name for f in os.scandir(os.getcwd()) if f.is_dir()]
+    #         dirs.sort(key=os.path.getctime)
+    #         path = dirs[-1]  # Sorts folders by date modified, most recent checkpoint is the last
+    #         checkpoint_path = path
+    #         path = os.path.basename(checkpoint_path)
 
-        accelerator.print(f"Resumed from checkpoint: {checkpoint_path}")
-        accelerator.load_state(checkpoint_path)
-        # Extract `epoch_{i}` or `step_{i}`
-        training_difference = os.path.splitext(path)[0]
+    #     accelerator.print(f"Resumed from checkpoint: {checkpoint_path}")
+    #     accelerator.load_state(checkpoint_path)
+    #     # Extract `epoch_{i}` or `step_{i}`
+    #     training_difference = os.path.splitext(path)[0]
 
-        if "epoch" in training_difference:
-            starting_epoch = int(training_difference.replace("epoch_", "")) + 1
-            resume_step = None
-            completed_steps = starting_epoch * num_update_steps_per_epoch
-        else:
-            # need to multiply `gradient_accumulation_steps` to reflect real steps
-            resume_step = int(training_difference.replace("step_", "")) * args.gradient_accumulation_steps
-            starting_epoch = resume_step // len(train_dataloader)
-            completed_steps = resume_step // args.gradient_accumulation_steps
-            resume_step -= starting_epoch * len(train_dataloader)
+    #     if "epoch" in training_difference:
+    #         starting_epoch = int(training_difference.replace("epoch_", "")) + 1
+    #         resume_step = None
+    #         completed_steps = starting_epoch * num_update_steps_per_epoch
+    #     else:
+    #         # need to multiply `gradient_accumulation_steps` to reflect real steps
+    #         resume_step = int(training_difference.replace("step_", "")) * args.gradient_accumulation_steps
+    #         starting_epoch = resume_step // len(train_dataloader)
+    #         completed_steps = resume_step // args.gradient_accumulation_steps
+    #         resume_step -= starting_epoch * len(train_dataloader)
 
-    # update the progress_bar if load from checkpoint
-    progress_bar.update(completed_steps)
+    # # update the progress_bar if load from checkpoint
+    # progress_bar.update(completed_steps)
 
-    best_loss = float("inf")
-    best_epoch = None
+    # best_loss = float("inf")
+    # best_epoch = None
         
-    for epoch in range(starting_epoch, args.num_train_epochs):
-        encoder.train()
-        model.train()
-        total_loss = 0
-        if args.with_tracking:
-            total_loss = 0
-        if args.resume_from_checkpoint and epoch == starting_epoch and resume_step is not None:
-            # We skip the first `n` batches in the dataloader when resuming from a checkpoint
-            active_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
-        else:
-            active_dataloader = train_dataloader
+    # for epoch in range(starting_epoch, args.num_train_epochs):
+    #     encoder.train()
+    #     model.train()
+    #     total_loss = 0
+    #     if args.with_tracking:
+    #         total_loss = 0
+    #     if args.resume_from_checkpoint and epoch == starting_epoch and resume_step is not None:
+    #         # We skip the first `n` batches in the dataloader when resuming from a checkpoint
+    #         active_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
+    #     else:
+    #         active_dataloader = train_dataloader
         
-        for step, batch in enumerate(active_dataloader):
-            with accelerator.accumulate(model):
-                with torch.no_grad():
-                    encodings = encoder(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
+    #     for step, batch in enumerate(active_dataloader):
+    #         with accelerator.accumulate(model):
+    #             with torch.no_grad():
+    #                 encodings = encoder(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
 
-                outputs = model(encodings.last_hidden_state, labels=batch['labels'])
-                loss = outputs.loss
-                # We keep track of the loss at each epoch
-                total_loss += loss.detach().float()
-                if args.with_tracking:
-                    total_loss += loss.detach().float()
-                accelerator.backward(loss)
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+    #             outputs = model(encodings.last_hidden_state, labels=batch['labels'])
+    #             loss = outputs.loss
+    #             # We keep track of the loss at each epoch
+    #             total_loss += loss.detach().float()
+    #             if args.with_tracking:
+    #                 total_loss += loss.detach().float()
+    #             accelerator.backward(loss)
+    #             optimizer.step()
+    #             lr_scheduler.step()
+    #             optimizer.zero_grad()
 
-            # Checks if the accelerator has performed an optimization step behind the scenes
-            if accelerator.sync_gradients:
-                progress_bar.update(1)
-                completed_steps += 1
+    #         # Checks if the accelerator has performed an optimization step behind the scenes
+    #         if accelerator.sync_gradients:
+    #             progress_bar.update(1)
+    #             completed_steps += 1
 
-            if isinstance(checkpointing_steps, int):
-                if completed_steps % checkpointing_steps == 0:
-                    output_dir = f"step_{completed_steps}"
-                    if args.output_dir is not None:
-                        output_dir = os.path.join(args.output_dir, output_dir)
-                    accelerator.save_state(output_dir)
+    #         if isinstance(checkpointing_steps, int):
+    #             if completed_steps % checkpointing_steps == 0:
+    #                 output_dir = f"step_{completed_steps}"
+    #                 if args.output_dir is not None:
+    #                     output_dir = os.path.join(args.output_dir, output_dir)
+    #                 accelerator.save_state(output_dir)
 
-            if completed_steps >= args.max_train_steps:
-                break
+    #         if completed_steps >= args.max_train_steps:
+    #             break
     
-        train_loss = total_loss.item() / len(train_dataloader)
-        logger.info(f"epoch: {epoch} train_loss: {train_loss}")
+    #     train_loss = total_loss.item() / len(train_dataloader)
+    #     logger.info(f"epoch: {epoch} train_loss: {train_loss}")
 
-        encoder.eval()
-        model.eval()
-        losses = []
-        for step, batch in enumerate(eval_dataloader):
-            with torch.no_grad():
-                encodings = encoder(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
-                outputs = model(encodings.last_hidden_state, labels=batch['labels'])
-            loss = outputs.loss
-            losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
+    #     encoder.eval()
+    #     model.eval()
+    #     losses = []
+    #     for step, batch in enumerate(eval_dataloader):
+    #         with torch.no_grad():
+    #             encodings = encoder(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
+    #             outputs = model(encodings.last_hidden_state, labels=batch['labels'])
+    #         loss = outputs.loss
+    #         losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
 
-        losses = torch.cat(losses)
-        eval_loss = torch.mean(losses)
-        logger.info(f"epoch: {epoch} eval_loss: {eval_loss}")
+    #     losses = torch.cat(losses)
+    #     eval_loss = torch.mean(losses)
+    #     logger.info(f"epoch: {epoch} eval_loss: {eval_loss}")
 
-        # if args.with_tracking:
-        #     accelerator.log(
-        #         {
-        #             # "perplexity": perplexity,
-        #             "eval_loss": eval_loss,
-        #             "train_loss": total_loss.item() / len(train_dataloader),
-        #             "epoch": epoch,
-        #             "step": completed_steps,
-        #         },
-        #         step=completed_steps,
-        #     )
+    #     # if args.with_tracking:
+    #     #     accelerator.log(
+    #     #         {
+    #     #             # "perplexity": perplexity,
+    #     #             "eval_loss": eval_loss,
+    #     #             "train_loss": total_loss.item() / len(train_dataloader),
+    #     #             "epoch": epoch,
+    #     #             "step": completed_steps,
+    #     #         },
+    #     #         step=completed_steps,
+    #     #     )
 
-        if eval_loss < best_loss:
-            best_loss = eval_loss
-            best_model_dir = f"epoch_{epoch}"
+    #     if eval_loss < best_loss:
+    #         best_loss = eval_loss
+    #         best_model_dir = f"epoch_{epoch}"
 
-            epochs_no_improve = 0
-        else:
-            epochs_no_improve += 1
+    #         epochs_no_improve = 0
+    #     else:
+    #         epochs_no_improve += 1
         
-        # if args.push_to_hub and epoch < args.num_train_epochs - 1:
-        #     accelerator.wait_for_everyone()
-        #     unwrapped_model = accelerator.unwrap_model(model)
-        #     unwrapped_model.save_pretrained(
-        #         args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
-        #     )
-        #     if accelerator.is_main_process:
-        #         tokenizer.save_pretrained(args.output_dir)
-        #         repo.push_to_hub(
-        #             commit_message=f"Training in progress epoch {epoch}", blocking=False, auto_lfs_prune=True
-        #         )
+    #     # if args.push_to_hub and epoch < args.num_train_epochs - 1:
+    #     #     accelerator.wait_for_everyone()
+    #     #     unwrapped_model = accelerator.unwrap_model(model)
+    #     #     unwrapped_model.save_pretrained(
+    #     #         args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
+    #     #     )
+    #     #     if accelerator.is_main_process:
+    #     #         tokenizer.save_pretrained(args.output_dir)
+    #     #         repo.push_to_hub(
+    #     #             commit_message=f"Training in progress epoch {epoch}", blocking=False, auto_lfs_prune=True
+    #     #         )
 
-        if args.checkpointing_steps == "epoch":
-            output_dir = f"epoch_{epoch}"
-            if args.output_dir is not None:
-                output_dir = os.path.join(args.output_dir, output_dir)
-            accelerator.save_state(output_dir, safe_serialization=False)
+    #     if args.checkpointing_steps == "epoch":
+    #         output_dir = f"epoch_{epoch}"
+    #         if args.output_dir is not None:
+    #             output_dir = os.path.join(args.output_dir, output_dir)
+    #         accelerator.save_state(output_dir, safe_serialization=False)
         
-        if accelerator.is_main_process:
-            # Get a list of all directories in the parent directory
-            all_dirs_exclude_best = [str(pth) for pth in Path(args.output_dir).iterdir() if pth.is_dir()]# and os.path.basename(pth) != best_model_dir]
+    #     if accelerator.is_main_process:
+    #         # Get a list of all directories in the parent directory
+    #         all_dirs_exclude_best = [str(pth) for pth in Path(args.output_dir).iterdir() if pth.is_dir() and os.path.basename(pth) != best_model_dir]
 
-            # Sort the directories by modification time (latest first)
-            all_dirs_exclude_best.sort(key=os.path.getmtime, reverse=True)
+    #         # Sort the directories by modification time (latest first)
+    #         all_dirs_exclude_best.sort(key=os.path.getmtime, reverse=True)
 
-            if len(all_dirs_exclude_best) > args.max_save_limit-1:
-                dirs_to_keep = all_dirs_exclude_best[:args.max_save_limit-1]
+    #         if len(all_dirs_exclude_best) > args.max_save_limit-1:
+    #             dirs_to_keep = all_dirs_exclude_best[:args.max_save_limit-1]
 
-                # Loop through all directories and remove them if they are not in the list of directories to keep
-                for dir in all_dirs_exclude_best:
-                    if dir not in dirs_to_keep:
-                        shutil.rmtree(dir)
+    #             # Loop through all directories and remove them if they are not in the list of directories to keep
+    #             for dir in all_dirs_exclude_best:
+    #                 if dir not in dirs_to_keep:
+    #                     shutil.rmtree(dir)
         
-        if args.early_stopping_patience is not None and epochs_no_improve > args.early_stopping_patience:
-            logger.info(f"Early stopping at epoch {epoch}")
-            break
+    #     if args.early_stopping_patience is not None and epochs_no_improve > args.early_stopping_patience:
+    #         logger.info(f"Early stopping at epoch {epoch}")
+    #         break
 
+    best_model_dir = f"epoch_{99}"
     accelerator.wait_for_everyone()
     logger.info("*** Test ***")
     logger.info("Loading best checkpoint from: %s", os.path.join(args.output_dir, best_model_dir))
