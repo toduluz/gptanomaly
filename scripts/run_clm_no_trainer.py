@@ -34,6 +34,7 @@ from pathlib import Path
 
 import datasets
 import pandas as pd
+from sklearn.model_selection import train_test_split
 import torch
 from accelerate import Accelerator, DistributedType
 from accelerate.logging import get_logger
@@ -427,7 +428,7 @@ def main():
                 # Join the list into text
                 train_df['Content'] = train_df['Content'].apply(' '.join)
                 # Only get normal samples
-                train_df = train_df[train_df['Label'] == 0]
+                # train_df = train_df[train_df['Label'] == 0]
         if args.test_path is not None:
             with open(args.test_path, "rb") as f:
                 test_data = pickle.load(f)
@@ -440,8 +441,9 @@ def main():
                 test_df['Content'] = test_df['Content'].apply(' '.join)
 
         # Split the training data into training and validation
-        train_df = train_df.head(int(len(train_df) * (100 - args.validation_split_percentage) / 100))
-        val_df = train_df.tail(int(len(train_df) * args.validation_split_percentage / 100))
+        train_df, val_df = train_test_split(train_df, test_size=args.validation_split_percentage / 100, shuffle=False)
+        val_df = val_df[val_df['Label'] == 0]
+
         # Set the max number of samples for training and validation and test 
         if args.max_train_samples is not None:
             train_df = train_df.head(args.max_train_samples)
@@ -454,7 +456,7 @@ def main():
         raw_datasets['train'] = datasets.Dataset.from_pandas(train_df)
         raw_datasets['validation'] = datasets.Dataset.from_pandas(val_df)
 
-        test_dataset = datasets.Dataset.from_pandas(test_df)
+        raw_test_dataset = datasets.Dataset.from_pandas(test_df)
 
     # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
     # https://huggingface.co/docs/datasets/loading_datasets.
@@ -591,18 +593,17 @@ def main():
     train_dataset = lm_datasets["train"]
     eval_dataset = lm_datasets["validation"]
 
-    column_names = test_dataset.column_names
+    column_names = raw_test_dataset.column_names
     text_column_name = "Content" if "Content" in column_names else column_names[0]
     def truncate_sentences(examples):
         batch = tokenizer(examples[text_column_name], truncation=True, max_length=block_size)
         batch['log_labels'] = examples['Label']
         batch["labels"] = batch["input_ids"].copy()
-        print(batch.keys())
 
         return batch
 
     with accelerator.main_process_first():
-        test_dataset = test_dataset.map(
+        test_dataset = raw_test_dataset.map(
             truncate_sentences,
             batched=True,
             num_proc=args.preprocessing_num_workers,
@@ -862,20 +863,34 @@ def main():
     model.eval()
     baseline_model.eval()
     def compute_metrics(preds, labels, difference):
+        best_f1 = 0
+        best_alpha = 0
+        best_precision = 0
+        best_recall = 0
 
-        predictions = []
-        for p in preds:
-            predict= 1 if p > difference else 0
-            predictions.append(predict)
-        
-        f1 = f1_score(labels, predictions)
-        precision = precision_score(labels, predictions)
-        recall = recall_score(labels, predictions)
+        for alpha in range(1, 10):
+            predictions = []
+            for p in preds:
+                predict= 1 if p > alpha * difference else 0
+                predictions.append(predict)
+            
+            f1 = f1_score(labels, predictions, zero_division=0)
+            precision = precision_score(labels, predictions, zero_division=0)
+            recall = recall_score(labels, predictions, zero_division=0)
+
+            if f1 > best_f1:
+                best_f1 = f1
+                best_precision = precision
+                best_recall = recall
+                best_alpha = alpha
+
+      
 
         return {
-            "f1_score": f1,
-            "precision": precision,
-            "recall": recall,
+            "f1": best_f1,
+            "precision": best_precision,
+            "recall": best_recall,
+            "alpha": best_alpha
         }
 
     differences_test = []
