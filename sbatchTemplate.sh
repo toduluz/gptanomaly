@@ -46,7 +46,6 @@ module load Python/3.11
 # This command assumes that you've already created the environment previously
 # We're using an absolute path here. You may use a relative path, as long as SRUN is execute in the same working directory
 source ~/gptanomaly/myenv/bin/activate
-pip install git+https://github.com/huggingface/transformers
 
 # Find out which GPU you are using
 srun whichgpu

@@ -907,12 +907,11 @@ def main():
             next_token = torch.argmax(next_token_logits, dim=-1)
             inputs = torch.cat([inputs, next_token.unsqueeze(0)], dim=-1)
 
-        percent = len(matches) / vocab_len
-        predictions.append(accelerator.gather(percent))
+        percent = torch.tensor(len(matches) / vocab_len, device=accelerator.device)
+        predictions.append(accelerator.gather(percent).cpu().numpy())
         labels.append(accelerator.gather(batch["log_labels"]).cpu().numpy())
 
-    # predictions = np.concatenate(predictions)
-    print(predictions)
+    predictions = np.concatenate(predictions)
     labels = np.concatenate(labels)
 
     results = compute_metrics(predictions, labels)
