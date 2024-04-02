@@ -57,9 +57,10 @@ from transformers import (
 )
 from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
-import evaluate
 from sklearn.metrics import f1_score, precision_score, recall_score
 import numpy as np
+
+from data.vocab import Vocab
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -104,6 +105,12 @@ def parse_args():
         type=str,
         default=None,
         help="A file containing the test data.",
+    )
+    parser.add_argument(
+        "--log_template_file",
+        type=str,
+        default=None,
+        help="A file containing the log templates.",
     )
     parser.add_argument(
         "--validation_split_percentage",
@@ -258,13 +265,6 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--baseline_model_name_or_path",
-        type=str,
-        default=None,
-        help="Path to pretrained model or model identifier from huggingface.co/models.",
-        required=False,
-    )
-    parser.add_argument(
         "--max_train_samples",
         type=int,
         default=None,
@@ -366,6 +366,14 @@ def main():
             os.makedirs(args.output_dir, exist_ok=True)
     accelerator.wait_for_everyone()
 
+    # Read csv file
+    csv_template = args.log_template_file
+    ## Dataframe
+    df = pd.read_csv(csv_template)
+    log_template_list = df['EventTemplate'].tolist()
+        
+    vocab = Vocab(log_template_list)
+
     # Get the datasets: you can either provide your own CSV/JSON/TXT training and evaluation files (see below)
     # or just provide the name of one of the public datasets available on the hub at https://huggingface.co/datasets/
     # (the dataset will be downloaded automatically from the datasets Hub).
@@ -425,10 +433,15 @@ def main():
                 if train_df['Label'].apply(isinstance, args=(list,)).all():
                     # Find the max of each list in the 'label' column
                     train_df['Label'] = train_df['Label'].apply(max)
+                # Convert 'EventTemplate' to Vocab index for each item in the list in 'EventTemplate'
+                train_df['VocabIndex'] = train_df['EventTemplate'].apply(lambda x: [str(vocab.get_event(event)) for event in x])
+                train_df['VocabIndex'] = train_df['VocabIndex'].apply(' '.join)
                 # Join the list into text
-                train_df['Content'] = train_df['Content'].apply(' '.join)
+                train_df['text'] = train_df['EventTemplate'].apply(' '.join)
+                # Add text in front of text
+                train_df['text'] = 'The following is the log sequence: ' + train_df['text'] + '. ' + 'The log templates are: ' + train_df['VocabIndex'] + '.'
                 # Only get normal samples
-                # train_df = train_df[train_df['Label'] == 0]
+                train_df = train_df[train_df['Label'] == 0]
         if args.test_path is not None:
             with open(args.test_path, "rb") as f:
                 test_data = pickle.load(f)
@@ -437,12 +450,17 @@ def main():
                 if test_df['Label'].apply(isinstance, args=(list,)).all():
                     # Find the max of each list in the 'label' column
                     test_df['Label'] = test_df['Label'].apply(max)
+                # Convert 'EventTemplate' to Vocab index
+                test_df['VocabIndex'] = test_df['EventTemplate'].apply(lambda x: [str(vocab.get_event(event)) for event in x])
+                test_df['VocabIndex'] = test_df['VocabIndex'].apply(' '.join)
                 # Join the list into text
-                test_df['Content'] = test_df['Content'].apply(' '.join)
+                test_df['text'] = test_df['EventTemplate'].apply(' '.join)
+                # Add text in front of text
+                test_df['text'] = 'The following is the log sequence: ' + test_df['text'] + '. ' + 'The log templates are: '
 
         # Split the training data into training and validation
         train_df, val_df = train_test_split(train_df, test_size=args.validation_split_percentage / 100, shuffle=False)
-        val_df = val_df[val_df['Label'] == 0]
+        # val_df = val_df[val_df['Label'] == 0]
 
         # Set the max number of samples for training and validation and test 
         if args.max_train_samples is not None:
@@ -505,18 +523,6 @@ def main():
         logger.info("Training new model from scratch")
         model = AutoModelForCausalLM.from_config(config, trust_remote_code=args.trust_remote_code)
 
-    if args.baseline_model_name_or_path:
-        baseline_config = AutoConfig.from_pretrained(
-            args.baseline_model_name_or_path,
-            trust_remote_code=args.trust_remote_code,
-        )
-        baseline_model = AutoModelForCausalLM.from_pretrained(
-            args.baseline_model_name_or_path,
-            from_tf=bool(".ckpt" in args.baseline_model_name_or_path),
-            config=baseline_config,
-            trust_remote_code=args.trust_remote_code,
-        )
-
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
     embedding_size = model.get_input_embeddings().weight.shape[0]
@@ -526,7 +532,7 @@ def main():
     # Preprocessing the datasets.
     # First we tokenize all the texts.
     column_names = raw_datasets["train"].column_names
-    text_column_name = "Content" if "Content" in column_names else column_names[0]
+    text_column_name = "text"
 
     def tokenize_function(examples):
         batch = tokenizer(examples[text_column_name])
@@ -594,10 +600,11 @@ def main():
     eval_dataset = lm_datasets["validation"]
 
     column_names = raw_test_dataset.column_names
-    text_column_name = "Content" if "Content" in column_names else column_names[0]
+    text_column_name = "text"
     def truncate_sentences(examples):
         batch = tokenizer(examples[text_column_name], truncation=True, max_length=block_size)
         batch['log_labels'] = examples['Label']
+        batch['vocab_index'] = tokenizer(examples['VocabIndex'], truncation=True, max_length=block_size)['input_ids']
         batch["labels"] = batch["input_ids"].copy()
 
         return batch
@@ -660,8 +667,8 @@ def main():
     )
 
     # Prepare everything with our `accelerator`.
-    model, baseline_model, optimizer, train_dataloader, eval_dataloader, test_dataloader, lr_scheduler = accelerator.prepare(
-        model, baseline_model, optimizer, train_dataloader, eval_dataloader, test_dataloader, lr_scheduler
+    model, optimizer, train_dataloader, eval_dataloader, test_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, eval_dataloader, test_dataloader, lr_scheduler
     )
 
     # On TPU, the tie weights in our model have been disconnected, so we need to restore the ties.
@@ -773,35 +780,25 @@ def main():
                 break
 
         model.eval()
-        baseline_model.eval()
         losses = []
-        baseline_losses = []
         for step, batch in enumerate(eval_dataloader):
             with torch.no_grad():
                 outputs = model(**batch)
-                baseline_outputs = baseline_model(**batch)
 
             loss = outputs.loss
-            baseline_loss = baseline_outputs.loss
             losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
-            baseline_losses.append(accelerator.gather_for_metrics(baseline_loss.repeat(args.per_device_eval_batch_size)))
 
         losses = torch.cat(losses)
-        baseline_losses = torch.cat(baseline_losses)
 
         try:
             eval_loss = torch.mean(losses)
             perplexity = math.exp(eval_loss)
-            eval_baseline_loss = torch.mean(baseline_losses)
-            baseline_perplexity = math.exp(eval_baseline_loss)
-            ratio = perplexity / baseline_perplexity
-            difference = perplexity - baseline_perplexity
 
         except OverflowError:
             perplexity = float("inf")
             baseline_perplexity = float("inf")
 
-        logger.info(f"epoch {epoch}: perplexity: {perplexity} eval_loss: {eval_loss}" f" baseline_perplexity: {baseline_perplexity} eval_baseline_loss: {eval_baseline_loss}" f" difference: {difference}" f" ratio: {ratio}")
+        logger.info(f"epoch {epoch}: perplexity: {perplexity} eval_loss: {eval_loss}")
 
         if args.with_tracking:
             accelerator.log(
@@ -861,59 +858,64 @@ def main():
     
     ### Test the model ###
     model.eval()
-    baseline_model.eval()
-    def compute_metrics(preds, labels, difference):
+    def compute_metrics(matches, labels):
         best_f1 = 0
-        best_alpha = 0
         best_precision = 0
         best_recall = 0
-
-        for alpha in range(1, 10):
+        best_threshold = 0
+        print(len(matches), len(labels))
+        for threshold in np.arange(0.5, 1, 0.1):
             predictions = []
-            for p in preds:
-                predict= 1 if p > alpha * difference else 0
-                predictions.append(predict)
-            
+            for match in matches:
+                predictions.append(1 if match < threshold else 0)
             f1 = f1_score(labels, predictions, zero_division=0)
-            precision = precision_score(labels, predictions, zero_division=0)
-            recall = recall_score(labels, predictions, zero_division=0)
-
             if f1 > best_f1:
                 best_f1 = f1
-                best_precision = precision
-                best_recall = recall
-                best_alpha = alpha
-
-      
-
+                best_precision = precision_score(labels, predictions, zero_division=0)
+                best_recall = recall_score(labels, predictions, zero_division=0)
+                best_threshold = threshold
+       
         return {
             "f1": best_f1,
             "precision": best_precision,
             "recall": best_recall,
-            "alpha": best_alpha
+            "threshold": best_threshold
         }
 
-    differences_test = []
-    labels = []
-    for step, batch in enumerate(test_dataloader):
-        with torch.no_grad():
-            outputs = model(batch["input_ids"], labels=batch["labels"], attention_mask=batch["attention_mask"])
-            baseline_outputs = baseline_model(batch["input_ids"], labels=batch["labels"], attention_mask=batch["attention_mask"])
 
-        loss = outputs.loss
-        baseline_loss = baseline_outputs.loss
-        
-        perplexity = math.exp(loss)
-        baseline_perplexity = math.exp(baseline_loss)
-        difference = perplexity - ratio * baseline_perplexity
-        difference_tensor = torch.full((args.per_device_test_batch_size,), difference, device=accelerator.device)
-        differences_test.append(accelerator.gather(difference_tensor).cpu().numpy())
+
+    labels = []
+    predictions = []
+    K = 5
+    for step, batch in enumerate(test_dataloader):
+
+        matches = []
+        vocab_len = batch['vocab_index'].shape[1]
+        for i in range(vocab_len - 1):
+            inputs = batch["input_ids"]
+            with torch.no_grad():
+                outputs = model(inputs)
+            
+            next_token_logits = outputs.logits[:, -1, :]
+            top_k_tokens = torch.topk(next_token_logits, K).indices
+
+            # Check if any of the top K tokens match the vocab index
+            match = batch['vocab_index'][0][i] in top_k_tokens[0]
+            matches.append(match)
+
+            # Add the most likely token to the sequence
+            next_token = torch.argmax(next_token_logits, dim=-1)
+            inputs = torch.cat([inputs, next_token.unsqueeze(0)], dim=-1)
+
+        percent = len(matches) / vocab_len
+        predictions.append(accelerator.gather(percent))
         labels.append(accelerator.gather(batch["log_labels"]).cpu().numpy())
 
-    differences_test = np.concatenate(differences_test)
+    # predictions = np.concatenate(predictions)
+    print(predictions)
     labels = np.concatenate(labels)
 
-    results = compute_metrics(differences_test, labels, difference)
+    results = compute_metrics(predictions, labels)
     logger.info(f"Test results: {results}")
 
 
