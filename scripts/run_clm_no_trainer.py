@@ -867,7 +867,7 @@ def main():
         best_recall = 0
         best_threshold = 0
         average_of_matches = np.mean(matches)
-        print(len(matches), len(labels))
+        # print(len(matches), len(labels))
         for threshold in np.arange(0, 1, 0.1):
             predictions = []
             for match in matches:
@@ -897,7 +897,7 @@ def main():
         vocab_len = batch['vocab_index'].shape[1]
         # print(batch['input_ids'].shape, batch['attention_mask'].shape, vocab_len)
         with torch.no_grad():
-            sample_output = model.generate(
+            sample_output = model.module.generate(
             input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
             max_new_tokens=vocab_len,
             do_sample=True,
@@ -924,7 +924,7 @@ def main():
         labels.append(accelerator.gather(batch["log_labels"]).cpu().numpy())
 
     # print(predictions)
-    # predictions = np.concatenate(predictions)
+    predictions = np.concatenate(predictions)
     labels = np.concatenate(labels)
 
     results = compute_metrics(predictions, labels)
