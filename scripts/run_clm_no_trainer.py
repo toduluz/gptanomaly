@@ -439,7 +439,7 @@ def main():
                 # Join the list into text
                 train_df['text'] = train_df['EventTemplate'].apply(' '.join)
                 # Add text in front of text
-                train_df['text'] = 'The following is the log sequence: ' + train_df['text'] + '. ' + 'The log templates are: ' + train_df['VocabIndex'] + '.'
+                train_df['text'] = 'The following is the log sequence: ' + train_df['text'] + '. ' + 'The log templates are: ' + train_df['VocabIndex']
                 # Only get normal samples
                 train_df = train_df[train_df['Label'] == 0]
         if args.test_path is not None:
@@ -453,6 +453,7 @@ def main():
                 # Convert 'EventTemplate' to Vocab index
                 test_df['VocabIndex'] = test_df['EventTemplate'].apply(lambda x: [str(vocab.get_event(event)) for event in x])
                 test_df['VocabIndex'] = test_df['VocabIndex'].apply(' '.join)
+                
                 # Join the list into text
                 test_df['text'] = test_df['EventTemplate'].apply(' '.join)
                 # Add text in front of text
@@ -602,9 +603,11 @@ def main():
     column_names = raw_test_dataset.column_names
     text_column_name = "text"
     def truncate_sentences(examples):
-        batch = tokenizer(examples[text_column_name], truncation=True, max_length=block_size)
+        vocab_index = tokenizer(examples['VocabIndex'], truncation=True, max_length=block_size)['input_ids']
+        max_length_for_test = block_size - len(vocab_index)
+        batch = tokenizer(examples[text_column_name], truncation=True, max_length=max_length_for_test)
         batch['log_labels'] = examples['Label']
-        batch['vocab_index'] = tokenizer(examples['VocabIndex'], truncation=True, max_length=block_size)['input_ids']
+        batch['vocab_index'] = vocab_index
         batch["labels"] = batch["input_ids"].copy()
 
         return batch
@@ -863,9 +866,9 @@ def main():
         best_precision = 0
         best_recall = 0
         best_threshold = 0
-        average = np.average(matches)
+        average_of_matches = np.mean(matches)
         print(len(matches), len(labels))
-        for threshold in np.arange(0.5, 1, 0.1):
+        for threshold in np.arange(0, 1, 0.1):
             predictions = []
             for match in matches:
                 predictions.append(1 if match < threshold else 0)
@@ -881,7 +884,7 @@ def main():
             "precision": best_precision,
             "recall": best_recall,
             "threshold": best_threshold,
-            "average": average
+            "average": average_of_matches
         }
 
 
@@ -891,29 +894,37 @@ def main():
     K = 5
     for step, batch in enumerate(test_dataloader):
 
-        matches = []
         vocab_len = batch['vocab_index'].shape[1]
-        inputs = batch["input_ids"]
-        for i in range(vocab_len - 1):
-            with torch.no_grad():
-                outputs = model(inputs)
-            
-            next_token_logits = outputs.logits[:, -1, :]
-            top_k_tokens = torch.topk(next_token_logits, K).indices
+        # print(batch['input_ids'].shape, batch['attention_mask'].shape, vocab_len)
+        with torch.no_grad():
+            sample_output = model.generate(
+            input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
+            max_new_tokens=vocab_len,
+            do_sample=True,
+            top_p=0.92,
+            top_k=50,
+            num_return_sequences=K,
+        )
+        
+        # print(vocab_len, batch['input_ids'].shape, sample_output.shape)
+        
+        # Obtain the generated sequence
+        generated_sequence = sample_output[:, batch['input_ids'].shape[1]:]
+        # print(generated_sequence.shape)
+        
+        matches = generated_sequence == batch['vocab_index'].expand_as(generated_sequence)
+        # print(type(matches), matches.shape)
+        # print(matches)
 
-            # Check if any of the top K tokens match the vocab index
-            match = batch['vocab_index'][0][i+1] in top_k_tokens[0]
-            matches.append(match)
+        # Get average of matches
+        average_matches = matches.float().mean(dim=1).mean(dim=0)
+        # print(average_matches)
 
-            # Add the most likely token to the sequence
-            next_token = torch.argmax(next_token_logits, dim=-1)
-            inputs = torch.cat([inputs, next_token.unsqueeze(0)], dim=-1)
-
-        percent = torch.tensor(len(matches) / vocab_len, device=accelerator.device)
-        predictions.append(accelerator.gather(percent).cpu().numpy())
+        predictions.append(accelerator.gather(average_matches).cpu().numpy())
         labels.append(accelerator.gather(batch["log_labels"]).cpu().numpy())
 
-    predictions = np.concatenate(predictions)
+    # print(predictions)
+    # predictions = np.concatenate(predictions)
     labels = np.concatenate(labels)
 
     results = compute_metrics(predictions, labels)
