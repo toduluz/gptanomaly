@@ -863,6 +863,7 @@ def main():
         best_precision = 0
         best_recall = 0
         best_threshold = 0
+        average = np.average(matches)
         print(len(matches), len(labels))
         for threshold in np.arange(0.5, 1, 0.1):
             predictions = []
@@ -879,7 +880,8 @@ def main():
             "f1": best_f1,
             "precision": best_precision,
             "recall": best_recall,
-            "threshold": best_threshold
+            "threshold": best_threshold,
+            "average": average
         }
 
 
@@ -891,8 +893,8 @@ def main():
 
         matches = []
         vocab_len = batch['vocab_index'].shape[1]
+        inputs = batch["input_ids"]
         for i in range(vocab_len - 1):
-            inputs = batch["input_ids"]
             with torch.no_grad():
                 outputs = model(inputs)
             
@@ -900,7 +902,7 @@ def main():
             top_k_tokens = torch.topk(next_token_logits, K).indices
 
             # Check if any of the top K tokens match the vocab index
-            match = batch['vocab_index'][0][i] in top_k_tokens[0]
+            match = batch['vocab_index'][0][i+1] in top_k_tokens[0]
             matches.append(match)
 
             # Add the most likely token to the sequence

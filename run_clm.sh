@@ -1,4 +1,4 @@
-DATASET_NAME=HDFS
+DATASET_NAME=BGL
 main_process_port=$(( $RANDOM % 10 + 29500 ))
 echo "Main process port: $main_process_port"
 
