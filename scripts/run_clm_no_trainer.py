@@ -894,37 +894,45 @@ def main():
     K = 5
     for step, batch in enumerate(test_dataloader):
 
+        matches = []
         vocab_len = batch['vocab_index'].shape[1]
-        # print(batch['input_ids'].shape, batch['attention_mask'].shape, vocab_len)
-        with torch.no_grad():
-            sample_output = model.module.generate(
-            input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
-            max_new_tokens=vocab_len,
-            do_sample=True,
-            top_p=0.92,
-            top_k=50,
-            num_return_sequences=K,
-        )
-        
-        # print(vocab_len, batch['input_ids'].shape, sample_output.shape)
-        
-        # Obtain the generated sequence
-        generated_sequence = sample_output[:, batch['input_ids'].shape[1]:]
-        # print(generated_sequence.shape)
-        
-        matches = generated_sequence == batch['vocab_index'].expand_as(generated_sequence)
-        # print(type(matches), matches.shape)
-        # print(matches)
+        for i in range(vocab_len):
+            
+            # Generate next token
+            with torch.no_grad():
+                outputs = model(batch['input_ids'], attention_mask=batch['attention_mask'])
+                logits = outputs.logits
 
-        # Get average of matches
-        average_matches = matches.float().mean(dim=1).mean(dim=0)
+            # Get the last prediction
+            # print(batch['input_ids'].shape, logits.shape)
+            next_token_logits = logits[:, -1, :]
+            next_token_id = torch.topk(next_token_logits, K).indices
+
+            # Check if vocab index is in the next token in pytorch tensor
+            match = next_token_id == batch['vocab_index'][:, i].expand_as(next_token_id)
+            # print(match.shape)
+
+            # Get 1 if any true
+            match = match.any(dim=-1).float()
+            # print(match)
+            matches.append(match)
+            
+            # Append next token to input_ids
+            batch['input_ids'] = torch.cat([batch['input_ids'], batch['vocab_index'][:, i].unsqueeze(0)], dim=1)
+            batch['attention_mask'] = torch.cat([batch['attention_mask'], torch.ones((batch['attention_mask'].shape[0], 1), device=accelerator.device)], dim=1)
+
+
+        average_matches = torch.sum(torch.cat(matches)) / vocab_len
         # print(average_matches)
+
+        # Convert to tensor
+        # average_matches = torch.tensor(average_matches, device=accelerator.device)
 
         predictions.append(accelerator.gather(average_matches).cpu().numpy())
         labels.append(accelerator.gather(batch["log_labels"]).cpu().numpy())
 
     # print(predictions)
-    predictions = np.concatenate(predictions)
+    # predictions = np.concatenate(predictions)
     labels = np.concatenate(labels)
 
     results = compute_metrics(predictions, labels)

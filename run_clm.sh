@@ -1,8 +1,8 @@
-DATASET_NAME=HDFS
+DATASET_NAME=BGL
 main_process_port=$(( $RANDOM % 10 + 29500 ))
 echo "Main process port: $main_process_port"
 
-NUM_SAMPLES=50
+NUM_SAMPLES=500
 export PYTHONPATH="${PYTHONPATH}:./"
 accelerate launch --main_process_port $main_process_port scripts/run_clm_no_trainer.py \
     --train_path ../dataset/${DATASET_NAME}/train.pkl \
