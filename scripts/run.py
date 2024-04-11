@@ -23,17 +23,14 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 import torch.nn as nn
 import torch.nn.functional as F
-from model import model
+from model.model import BiLSTM_Attention
 import transformers
 from transformers import (
     CONFIG_MAPPING,
     MODEL_MAPPING,
     AutoConfig,
     AutoModel,
-    AutoModelForMaskedLM,
     AutoTokenizer,
-    DataCollatorForLanguageModeling,
-    DataCollatorWithPadding,
     SchedulerType,
     get_scheduler,
 )
@@ -263,6 +260,12 @@ def parse_args():
         default=True,
         help="If passed, will only use normal samples for training and testing.",
     )
+    parser.add_argument(
+        "--template_path",
+        type=str,
+        default=None,
+        help="Path to the template file.",
+    )
     args = parser.parse_args()
 
     return args
@@ -319,9 +322,11 @@ def main():
             if train_df['Label'].apply(isinstance, args=(list,)).all():
                 # Find the max of each list in the 'label' column
                 train_df['Label'] = train_df['Label'].apply(max)
-            train_df['EventTemplate'] = train_df['EventTemplate'].apply(lambda x: ' '.join([i.replace('<*>', '') for i in x]))
+            # train_df['text'] = train_df['EventTemplate'].apply(lambda x: ' '.join(x))
             if args.normal_only:
                 train_df = train_df[train_df['Label'] == 0].reset_index(drop=True)
+            if args.max_train_samples and args.max_eval_samples:
+                train_df = train_df.sample(args.max_train_samples + int(args.validation_split_percentage / 100 * args.max_eval_samples)).reset_index(drop=True)
     if args.test_path is not None:
         with open(args.test_path, "rb") as f:
             test_data = pickle.load(f)
@@ -330,7 +335,10 @@ def main():
             if test_df['Label'].apply(isinstance, args=(list,)).all():
                 # Find the max of each list in the 'label' column
                 test_df['Label'] = test_df['Label'].apply(max)
-            test_df['EventTemplate'] = test_df['EventTemplate'].apply(lambda x: ' '.join([i.replace('<*>', '') for i in x]))
+            if args.max_test_samples:
+                test_df = test_df.sample(args.max_test_samples).reset_index(drop=True)
+            # test_df['text'] = test_df['EventTemplate'].apply(lambda x: ' '.join(x))
+
     
     # Load the dataset
     raw_datasets = datasets.Dataset.from_pandas(train_df).train_test_split(
@@ -343,18 +351,19 @@ def main():
     #
     # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
-    if args.config_name:
-        config = AutoConfig.from_pretrained(args.config_name, trust_remote_code=args.trust_remote_code)
-    elif args.model_name_or_path:
-        config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=args.trust_remote_code)
-    else:
-        config = CONFIG_MAPPING[args.model_type]()
-        logger.warning("You are instantiating a new config instance from scratch.")
+    # if args.config_name:
+    #     config = AutoConfig.from_pretrained(args.config_name, trust_remote_code=args.trust_remote_code)
+    # elif args.model_name_or_path:
+    #     config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=args.trust_remote_code)
+    # else:
+    #     config = CONFIG_MAPPING[args.model_type]()
+    #     logger.warning("You are instantiating a new config instance from scratch.")
     
     if args.encoder_name_or_path:
         encoder_config = AutoConfig.from_pretrained(args.encoder_name_or_path, trust_remote_code=args.trust_remote_code)
 
     print("*" * 100)
+
     if args.tokenizer_name:
         tokenizer = AutoTokenizer.from_pretrained(
             args.tokenizer_name, use_fast=not args.use_slow_tokenizer, trust_remote_code=args.trust_remote_code
@@ -368,20 +377,21 @@ def main():
             "You are instantiating a new tokenizer from scratch. This is not supported by this script. "
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
+    
     print("*" * 100)
 
-    # model = model.LogRobertaAEModelForMaskedLM(config)
-    if args.model_name_or_path:
-        model = AutoModelForMaskedLM.from_pretrained(
-            args.model_name_or_path,
-            from_tf=bool(".ckpt" in args.model_name_or_path),
-            config=config,
-            low_cpu_mem_usage=args.low_cpu_mem_usage,
-            trust_remote_code=args.trust_remote_code,
-        )
-    else:
-        logger.info("Training new model from scratch")
-        model = AutoModelForMaskedLM.from_config(config, trust_remote_code=args.trust_remote_code)
+    model = BiLSTM_Attention(embedding_dim=768, n_hidden=768)
+    # if args.model_name_or_path:
+    #     model = AutoModelForMaskedLM.from_pretrained(
+    #         args.model_name_or_path,
+    #         from_tf=bool(".ckpt" in args.model_name_or_path),
+    #         config=config,
+    #         low_cpu_mem_usage=args.low_cpu_mem_usage,
+    #         trust_remote_code=args.trust_remote_code,
+    #     )
+    # else:
+    #     logger.info("Training new model from scratch")
+    #     model = AutoModelForMaskedLM.from_config(config, trust_remote_code=args.trust_remote_code)
     
     if args.encoder_name_or_path:
         encoder = AutoModel.from_pretrained(
@@ -401,7 +411,7 @@ def main():
     # Preprocessing the datasets.
     # First we tokenize all the texts.
     column_names = raw_datasets["train"].column_names
-    text_column_name = "EventTemplate" if "EventTemplate" in column_names else column_names[0]
+    text_column_name = "Content" if "Content" in column_names else column_names[0]
 
     if args.max_seq_length is None:
         max_seq_length = tokenizer.model_max_length
@@ -419,38 +429,60 @@ def main():
                 f"model ({tokenizer.model_max_length}). Using max_seq_length={tokenizer.model_max_length}."
             )
         max_seq_length = min(args.max_seq_length, tokenizer.model_max_length)
+    
+    encoder.to(accelerator.device)
+
+    # Create dict of embeddings
+    template_embeddings = None
+    if args.template_path is not None:
+        # Read the CSV file
+        templates_df = pd.read_csv(args.template_path)
+
+        # For each template, tokenize and get the embeddings
+        template_embeddings = {}
+        for eventId, eventTemplate in zip(templates_df['EventId'], templates_df['EventTemplate']):
+            # Tokenize
+            input_ids = tokenizer.encode(eventTemplate, truncation=True, max_length=max_seq_length, return_tensors="pt")
+            # Get embeddings
+            with torch.no_grad():
+                template_embeddings[eventId] = (encoder(input_ids=input_ids.to(accelerator.device)).last_hidden_state[:, 0, :].squeeze(0).detach().cpu())
+        
+        # Save the embeddings
+        with open(args.output_dir + "/embeddings.pkl", "wb") as f:
+            pickle.dump(template_embeddings, f)
+        
+        # Load the embeddings
+        with open(args.output_dir + "/embeddings.pkl", "rb") as f:
+            template_embeddings = pickle.load(f)
 
     if args.line_by_line:
         # When using line_by_line, we just tokenize each nonempty line.
         padding = "max_length" if args.pad_to_max_length else False
 
         def preprocess_function(examples):
-            batch = tokenizer(
-                examples[text_column_name],
-                padding=padding,
-                truncation=True,
-                max_length=max_seq_length,
-                # We use this option because DataCollatorForLanguageModeling (see below) is more efficient when it
-                # receives the `special_tokens_mask`.
-                return_special_tokens_mask=False,
-            )
-            batch['log_labels'] = examples['Label']
-            return batch
+            batch = dict()
 
-        # def tokenize_function(examples):
-        #     # Remove empty lines
-        #     examples[text_column_name] = [
-        #         line for line in examples[text_column_name] if len(line) > 0 and not line.isspace()
-        #     ]
-        #     return tokenizer(
-        #         examples[text_column_name],
-        #         padding=padding,
-        #         truncation=True,
-        #         max_length=max_seq_length,
-        #         # We use this option because DataCollatorForLanguageModeling (see below) is more efficient when it
-        #         # receives the `special_tokens_mask`.
-        #         return_special_tokens_mask=True,
-        #     )
+            if template_embeddings is not None:
+                # Get the embeddings for the event templates
+                embeddings = []
+                for eventIds in examples['EventId']:
+                    sent_embeddings = torch.stack([template_embeddings[eventId] for eventId in eventIds])
+                    embeddings.append(sent_embeddings)
+                batch['embedding'] = embeddings
+            else:
+                batch['inputs'] = [tokenizer(text, truncation=True, padding=padding, max_length=max_seq_length, return_tensors="pt") for text in examples[text_column_name]]
+                embeddings = []
+                with torch.no_grad():
+                    for input in batch['inputs']:
+                        input.to(accelerator.device)
+                        embedding = encoder(input_ids=input['input_ids'], attention_mask=input['attention_mask']).last_hidden_state[:, 0, :].squeeze(0).detach().cpu()
+                        embeddings.append(embedding)
+                batch['embedding'] = embeddings
+                del batch['inputs']
+            
+            batch['log_labels'] = examples['Label']
+
+            return batch
 
         with accelerator.main_process_first():
             tokenized_datasets = raw_datasets.map(
@@ -510,134 +542,69 @@ def main():
                 desc=f"Grouping texts in chunks of {max_seq_length}",
             )
 
-    def precompute_logits(mlm_preds: torch.Tensor, k: int = 5) -> torch.Tensor:
-        # Return the top-k
-        return torch.topk(mlm_preds, k, dim=-1).indices
-    
-    def compute_metrics_for_test(mlm_preds: np.ndarray, mlm_labels: np.ndarray, secondary_logits: np.ndarray, log_labels: np.ndarray) -> dict:
-
-        top_k_accuracies = []
-
-        for preds, lbls in zip(mlm_preds, mlm_labels):
-            # Remove -100 values
-            mask = lbls != -100
-            preds = preds[mask]
-            lbls = lbls[mask]
-
-            # Check if the true labels are in the top-k predictions
-            correct = np.expand_dims(lbls, axis=-1) == preds
-
-            # Compute the top-k accuracy for the current sentence
-            top_k_accuracy = correct.any(axis=-1).mean()
-            
-            # Replace NaN values with 0
-            top_k_accuracy = np.nan_to_num(top_k_accuracy, nan=0)
-
-            top_k_accuracies.append(top_k_accuracy)
-
-        # Calculate the average of each sample
-        mean_of_each_sample = np.mean(secondary_logits, axis=1)
-        # print(mean_of_each_sample.shape)
-
-        # Calculate the overall mean and standard deviation
-        overall_mean = np.mean(mean_of_each_sample)
-        overall_std_dev = np.std(mean_of_each_sample)
-        # print(overall_mean, overall_std_dev)
-
-        # Calculate the distance of each sample's mean from the overall mean
-        distances = np.abs(mean_of_each_sample - overall_mean) / overall_std_dev
-        # print(distances.shape)
-
-        # Calculate the standard deviation of these distances
-        std_dev_of_distances = np.std(distances)
-        
-        return find_best_threshold(top_k_accuracies, np.linspace(0.51, 1.0), mean_of_each_sample, overall_std_dev, log_labels)
-    
-    def find_best_threshold(top_k_accuracies: list, accuracy_thresholds: np.ndarray, deviations: np.ndarray, std_dev, log_labels: np.ndarray) -> dict:
-        # best_threshold = 0
-        best_f1 = 0
-        best_precision = 0
-        best_recall = 0
-        best_roc_auc = 0
-        # best_d = 0
-
-        # for threshold in accuracy_thresholds:
-            # Compute the predictions
-        for d in range(1, 10):
-            preds = (deviations > d * std_dev)# (np.array(top_k_accuracies) < threshold) #| 
-
-            # Compute the metrics
-            f1 = f1_score(log_labels, preds)
-            precision = precision_score(log_labels, preds)
-            recall = recall_score(log_labels, preds)
-            roc_auc = roc_auc_score(log_labels, preds)
-
-            # Update the best metrics
-            if f1 > best_f1:
-                best_d = d
-                # best_threshold = threshold
-                best_f1 = f1
-                best_precision = precision
-                best_recall = recall
-                best_roc_auc = roc_auc
-            
-        return {
-            # "threshold": best_threshold,
-            "d": best_d,
-            "f1": best_f1,
-            "precision": best_precision,
-            "recall": best_recall,
-            "roc_auc": best_roc_auc,
-        }
-
     train_dataset = tokenized_datasets["train"]
     eval_dataset = tokenized_datasets["validation"]
     test_dataset = tokenized_datasets["test"]
-    if args.max_train_samples is not None:
-        train_dataset = train_dataset.select(range(args.max_train_samples))
-    if args.max_eval_samples is not None:
-        eval_dataset = eval_dataset.select(range(args.max_eval_samples))
-    if args.max_test_samples is not None:
-        test_dataset = test_dataset.select(range(args.max_test_samples))
+    # if args.max_train_samples is not None:
+    #     train_dataset = train_dataset.select(range(args.max_train_samples))
+    # if args.max_eval_samples is not None:
+    #     eval_dataset = eval_dataset.select(range(args.max_eval_samples))
+    # if args.max_test_samples is not None:
+    #     test_dataset = test_dataset.select(range(args.max_test_samples))
 
     # Conditional for small test subsets
-    if len(train_dataset) > 3:
-        # Log a few random samples from the training set:
-        for index in random.sample(range(len(train_dataset)), 3):
-            logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
+    # if len(train_dataset) > 3:
+    #     # Log a few random samples from the training set:
+    #     for index in random.sample(range(len(train_dataset)), 3):
+    #         logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
 
     # Data collator
     # This one will take care of randomly masking the tokens.
     # data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=args.mlm_probability)
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=args.mlm_probability)
+    # data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    def collate_fn(batch):
+        output = {}
+        for key in batch[0].keys():
+            if key == 'embedding':
+                # Pad!
+                max_length = max([len(x[key]) for x in batch])
+                
+                padded_batch = [torch.cat((torch.tensor(x[key]), torch.zeros(max_length - len(x[key]), len(x[key][0])))) if len(x[key]) < max_length else torch.tensor(x[key]) for x in batch]
+                output[key] = torch.stack(padded_batch)
+            else:
+                output[key] = torch.stack([torch.tensor(x[key]) for x in batch])
+
+        # Generate the last of the 
+        return output
+
 
     # DataLoaders creation:
     train_dataloader = DataLoader(
-        train_dataset, shuffle=True, collate_fn=data_collator, batch_size=args.per_device_train_batch_size
+        train_dataset, shuffle=True, collate_fn=collate_fn, batch_size=args.per_device_train_batch_size
     )
-    eval_dataloader = DataLoader(eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size)
-    test_dataloader = DataLoader(test_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size)
+    eval_dataloader = DataLoader(eval_dataset, collate_fn=collate_fn, batch_size=args.per_device_eval_batch_size)
+    test_dataloader = DataLoader(test_dataset, collate_fn=collate_fn, batch_size=args.per_device_eval_batch_size)
 
     # Optimizer
     # Split weights in two groups, one with weight decay and the other not.
-    no_decay = ["bias", "LayerNorm.weight"]
-    optimizer_grouped_parameters = [
-        {
-            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-            "weight_decay": args.weight_decay,
-        },
-        {
-            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
-            "weight_decay": 0.0,
-        },
-    ]
+    # no_decay = ["bias", "LayerNorm.weight"]
+    # optimizer_grouped_parameters = [
+    #     {
+    #         "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+    #         "weight_decay": args.weight_decay,
+    #     },
+    #     {
+    #         "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+    #         "weight_decay": 0.0,
+    #     },
+    # ]
     # discriminator_parameters = optimizer_grouped_parameters + [
     #     {
     #         "params": discriminator_model.parameters(),
     #         "weight_decay": args.weight_decay,
     #     }
     # ]
-    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
 
     # Note -> the training dataloader needs to be prepared before we grab his length below (cause its length will be
     # shorter in multiprocess)
@@ -657,8 +624,8 @@ def main():
     )
 
     # Prepare everything with our `accelerator`.
-    model, encoder, optimizer, train_dataloader, eval_dataloader, test_dataloader, lr_scheduler = accelerator.prepare(
-        model, encoder, optimizer, train_dataloader, eval_dataloader, test_dataloader, lr_scheduler
+    model, optimizer, train_dataloader, eval_dataloader, test_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, eval_dataloader, test_dataloader, lr_scheduler
     )
 
     # On TPU, the tie weights in our model have been disconnected, so we need to restore the ties.
@@ -686,220 +653,240 @@ def main():
         accelerator.init_trackers("mlm_no_trainer", experiment_config)
 
     # Train!
-    # total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+    total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
-    # logger.info("***** Running training *****")
-    # logger.info(f"  Num examples = {len(train_dataset)}")
-    # logger.info(f"  Num Epochs = {args.num_train_epochs}")
-    # logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
-    # logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
-    # logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-    # logger.info(f"  Total optimization steps = {args.max_train_steps}")
-    # # Only show the progress bar once on each machine.
-    # progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
-    # completed_steps = 0
-    # starting_epoch = 0
+    logger.info("***** Running training *****")
+    logger.info(f"  Num examples = {len(train_dataset)}")
+    logger.info(f"  Num Epochs = {args.num_train_epochs}")
+    logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
+    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+    logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    # Only show the progress bar once on each machine.
+    progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
+    completed_steps = 0
+    starting_epoch = 0
 
-    # # Potentially load in the weights and states from a previous save
-    # if args.resume_from_checkpoint:
-    #     if args.resume_from_checkpoint is not None or args.resume_from_checkpoint != "":
-    #         checkpoint_path = args.resume_from_checkpoint
-    #         path = os.path.basename(args.resume_from_checkpoint)
-    #     else:
-    #         # Get the most recent checkpoint
-    #         dirs = [f.name for f in os.scandir(os.getcwd()) if f.is_dir()]
-    #         dirs.sort(key=os.path.getctime)
-    #         path = dirs[-1]  # Sorts folders by date modified, most recent checkpoint is the last
-    #         checkpoint_path = path
-    #         path = os.path.basename(checkpoint_path)
+    # Potentially load in the weights and states from a previous save
+    if args.resume_from_checkpoint:
+        if args.resume_from_checkpoint is not None or args.resume_from_checkpoint != "":
+            checkpoint_path = args.resume_from_checkpoint
+            path = os.path.basename(args.resume_from_checkpoint)
+        else:
+            # Get the most recent checkpoint
+            dirs = [f.name for f in os.scandir(os.getcwd()) if f.is_dir()]
+            dirs.sort(key=os.path.getctime)
+            path = dirs[-1]  # Sorts folders by date modified, most recent checkpoint is the last
+            checkpoint_path = path
+            path = os.path.basename(checkpoint_path)
 
-    #     accelerator.print(f"Resumed from checkpoint: {checkpoint_path}")
-    #     accelerator.load_state(checkpoint_path)
-    #     # Extract `epoch_{i}` or `step_{i}`
-    #     training_difference = os.path.splitext(path)[0]
+        accelerator.print(f"Resumed from checkpoint: {checkpoint_path}")
+        accelerator.load_state(checkpoint_path)
+        # Extract `epoch_{i}` or `step_{i}`
+        training_difference = os.path.splitext(path)[0]
 
-    #     if "epoch" in training_difference:
-    #         starting_epoch = int(training_difference.replace("epoch_", "")) + 1
-    #         resume_step = None
-    #         completed_steps = starting_epoch * num_update_steps_per_epoch
-    #     else:
-    #         # need to multiply `gradient_accumulation_steps` to reflect real steps
-    #         resume_step = int(training_difference.replace("step_", "")) * args.gradient_accumulation_steps
-    #         starting_epoch = resume_step // len(train_dataloader)
-    #         completed_steps = resume_step // args.gradient_accumulation_steps
-    #         resume_step -= starting_epoch * len(train_dataloader)
+        if "epoch" in training_difference:
+            starting_epoch = int(training_difference.replace("epoch_", "")) + 1
+            resume_step = None
+            completed_steps = starting_epoch * num_update_steps_per_epoch
+        else:
+            # need to multiply `gradient_accumulation_steps` to reflect real steps
+            resume_step = int(training_difference.replace("step_", "")) * args.gradient_accumulation_steps
+            starting_epoch = resume_step // len(train_dataloader)
+            completed_steps = resume_step // args.gradient_accumulation_steps
+            resume_step -= starting_epoch * len(train_dataloader)
 
-    # # update the progress_bar if load from checkpoint
-    # progress_bar.update(completed_steps)
+    # update the progress_bar if load from checkpoint
+    progress_bar.update(completed_steps)
 
-    # best_loss = float("inf")
-    # best_epoch = None
+    best_loss = float("inf")
+    best_epoch = None
+    loss_fct = nn.MSELoss()
+
+    for epoch in range(starting_epoch, args.num_train_epochs):
+        model.train()
+
+        total_loss = 0
+        if args.with_tracking:
+            total_loss = 0
+        if args.resume_from_checkpoint and epoch == starting_epoch and resume_step is not None:
+            # We skip the first `n` batches in the dataloader when resuming from a checkpoint
+            active_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
+        else:
+            active_dataloader = train_dataloader
         
-    # for epoch in range(starting_epoch, args.num_train_epochs):
-    #     encoder.train()
-    #     model.train()
-    #     total_loss = 0
-    #     if args.with_tracking:
-    #         total_loss = 0
-    #     if args.resume_from_checkpoint and epoch == starting_epoch and resume_step is not None:
-    #         # We skip the first `n` batches in the dataloader when resuming from a checkpoint
-    #         active_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
-    #     else:
-    #         active_dataloader = train_dataloader
-        
-    #     for step, batch in enumerate(active_dataloader):
-    #         with accelerator.accumulate(model):
-    #             with torch.no_grad():
-    #                 encodings = encoder(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
+        for step, batch in enumerate(active_dataloader):
+            with accelerator.accumulate(model):
+                ae_input, ae_output = model(batch['embedding'])
+                loss = loss_fct(ae_output, ae_input)
+                
+                # We keep track of the loss at each epoch
+                total_loss += loss.detach().float()
+                if args.with_tracking:
+                    total_loss += loss.detach().float()
+                accelerator.backward(loss)
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
 
-    #             outputs = model(encodings.last_hidden_state, labels=batch['labels'])
-    #             loss = outputs.loss
-    #             # We keep track of the loss at each epoch
-    #             total_loss += loss.detach().float()
-    #             if args.with_tracking:
-    #                 total_loss += loss.detach().float()
-    #             accelerator.backward(loss)
-    #             optimizer.step()
-    #             lr_scheduler.step()
-    #             optimizer.zero_grad()
+            # Checks if the accelerator has performed an optimization step behind the scenes
+            if accelerator.sync_gradients:
+                progress_bar.update(1)
+                completed_steps += 1
 
-    #         # Checks if the accelerator has performed an optimization step behind the scenes
-    #         if accelerator.sync_gradients:
-    #             progress_bar.update(1)
-    #             completed_steps += 1
+            if isinstance(checkpointing_steps, int):
+                if completed_steps % checkpointing_steps == 0:
+                    output_dir = f"step_{completed_steps}"
+                    if args.output_dir is not None:
+                        output_dir = os.path.join(args.output_dir, output_dir)
+                    accelerator.save_state(output_dir)
 
-    #         if isinstance(checkpointing_steps, int):
-    #             if completed_steps % checkpointing_steps == 0:
-    #                 output_dir = f"step_{completed_steps}"
-    #                 if args.output_dir is not None:
-    #                     output_dir = os.path.join(args.output_dir, output_dir)
-    #                 accelerator.save_state(output_dir)
-
-    #         if completed_steps >= args.max_train_steps:
-    #             break
+            if completed_steps >= args.max_train_steps:
+                break
     
-    #     train_loss = total_loss.item() / len(train_dataloader)
-    #     logger.info(f"epoch: {epoch} train_loss: {train_loss}")
+        train_loss = total_loss.item() / len(train_dataloader)
+        logger.info(f"epoch: {epoch} train_loss: {train_loss}")
 
-    #     encoder.eval()
-    #     model.eval()
-    #     losses = []
-    #     for step, batch in enumerate(eval_dataloader):
-    #         with torch.no_grad():
-    #             encodings = encoder(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
-    #             outputs = model(encodings.last_hidden_state, labels=batch['labels'])
-    #         loss = outputs.loss
-    #         losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
+        model.eval()
+        eval_losses = []
+        for step, batch in enumerate(eval_dataloader):
+            with torch.no_grad():
+               ae_input, ae_output = model(batch['embedding'])
+            loss = loss_fct(ae_output, ae_input)
 
-    #     losses = torch.cat(losses)
-    #     eval_loss = torch.mean(losses)
-    #     logger.info(f"epoch: {epoch} eval_loss: {eval_loss}")
+            eval_losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
 
-    #     # if args.with_tracking:
-    #     #     accelerator.log(
-    #     #         {
-    #     #             # "perplexity": perplexity,
-    #     #             "eval_loss": eval_loss,
-    #     #             "train_loss": total_loss.item() / len(train_dataloader),
-    #     #             "epoch": epoch,
-    #     #             "step": completed_steps,
-    #     #         },
-    #     #         step=completed_steps,
-    #     #     )
+        losses = torch.cat(eval_losses)
+        eval_loss = torch.mean(losses)
+        logger.info(f"epoch: {epoch} eval_loss: {eval_loss}")
 
-    #     if eval_loss < best_loss:
-    #         best_loss = eval_loss
-    #         best_model_dir = f"epoch_{epoch}"
 
-    #         epochs_no_improve = 0
-    #     else:
-    #         epochs_no_improve += 1
+
+        # if args.with_tracking:
+        #     accelerator.log(
+        #         {
+        #             # "perplexity": perplexity,
+        #             "eval_loss": eval_loss,
+        #             "train_loss": total_loss.item() / len(train_dataloader),
+        #             "epoch": epoch,
+        #             "step": completed_steps,
+        #         },
+        #         step=completed_steps,
+        #     )
+
+        if eval_loss < best_loss:
+            best_loss = eval_loss
+            best_model_dir = f"epoch_{epoch}"
+            best_threshold = eval_loss.item()
+            # Save the best threshold as pickle
+            with open(os.path.join(args.output_dir, "best_threshold.pkl"), "wb") as f:
+                pickle.dump((best_threshold), f)
+
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
         
-    #     # if args.push_to_hub and epoch < args.num_train_epochs - 1:
-    #     #     accelerator.wait_for_everyone()
-    #     #     unwrapped_model = accelerator.unwrap_model(model)
-    #     #     unwrapped_model.save_pretrained(
-    #     #         args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
-    #     #     )
-    #     #     if accelerator.is_main_process:
-    #     #         tokenizer.save_pretrained(args.output_dir)
-    #     #         repo.push_to_hub(
-    #     #             commit_message=f"Training in progress epoch {epoch}", blocking=False, auto_lfs_prune=True
-    #     #         )
+        # if args.push_to_hub and epoch < args.num_train_epochs - 1:
+        #     accelerator.wait_for_everyone()
+        #     unwrapped_model = accelerator.unwrap_model(model)
+        #     unwrapped_model.save_pretrained(
+        #         args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
+        #     )
+        #     if accelerator.is_main_process:
+        #         tokenizer.save_pretrained(args.output_dir)
+        #         repo.push_to_hub(
+        #             commit_message=f"Training in progress epoch {epoch}", blocking=False, auto_lfs_prune=True
+        #         )
 
-    #     if args.checkpointing_steps == "epoch":
-    #         output_dir = f"epoch_{epoch}"
-    #         if args.output_dir is not None:
-    #             output_dir = os.path.join(args.output_dir, output_dir)
-    #         accelerator.save_state(output_dir, safe_serialization=False)
+        if args.checkpointing_steps == "epoch":
+            output_dir = f"epoch_{epoch}"
+            if args.output_dir is not None:
+                output_dir = os.path.join(args.output_dir, output_dir)
+            accelerator.save_state(output_dir, safe_serialization=False)
         
-    #     if accelerator.is_main_process:
-    #         # Get a list of all directories in the parent directory
-    #         all_dirs_exclude_best = [str(pth) for pth in Path(args.output_dir).iterdir() if pth.is_dir() and os.path.basename(pth) != best_model_dir]
+        if accelerator.is_main_process:
+            # Get a list of all directories in the parent directory
+            all_dirs_exclude_best = [str(pth) for pth in Path(args.output_dir).iterdir() if pth.is_dir() and os.path.basename(pth) != best_model_dir]
 
-    #         # Sort the directories by modification time (latest first)
-    #         all_dirs_exclude_best.sort(key=os.path.getmtime, reverse=True)
+            # Sort the directories by modification time (latest first)
+            all_dirs_exclude_best.sort(key=os.path.getmtime, reverse=True)
 
-    #         if len(all_dirs_exclude_best) > args.max_save_limit-1:
-    #             dirs_to_keep = all_dirs_exclude_best[:args.max_save_limit-1]
+            if len(all_dirs_exclude_best) > args.max_save_limit-1:
+                dirs_to_keep = all_dirs_exclude_best[:args.max_save_limit-1]
 
-    #             # Loop through all directories and remove them if they are not in the list of directories to keep
-    #             for dir in all_dirs_exclude_best:
-    #                 if dir not in dirs_to_keep:
-    #                     shutil.rmtree(dir)
+                # Loop through all directories and remove them if they are not in the list of directories to keep
+                for dir in all_dirs_exclude_best:
+                    if dir not in dirs_to_keep:
+                        shutil.rmtree(dir)
         
-    #     if args.early_stopping_patience is not None and epochs_no_improve > args.early_stopping_patience:
-    #         logger.info(f"Early stopping at epoch {epoch}")
-    #         break
+        if args.early_stopping_patience is not None and epochs_no_improve > args.early_stopping_patience:
+            logger.info(f"Early stopping at epoch {epoch}")
+            break
 
-    best_model_dir = f"epoch_{99}"
     accelerator.wait_for_everyone()
     logger.info("*** Test ***")
     logger.info("Loading best checkpoint from: %s", os.path.join(args.output_dir, best_model_dir))
     accelerator.load_state(os.path.join(args.output_dir, best_model_dir))
     model.eval()
-    encoder.eval()
+    # Load best threshold too
+    with open(os.path.join(args.output_dir, "best_threshold.pkl"), "rb") as f:
+        best_threshold = pickle.load(f)
     accelerator.wait_for_everyone()
 
-    mlm_preds = []
-    mlm_labels = []
-    secondary_logits = []
+    test_losses = []
     log_labels = []
 
     for steps, batch in enumerate(test_dataloader):
         with torch.no_grad():
-            encodings = encoder(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
-            outputs = model(encodings.last_hidden_state, labels=batch['labels'])
-
-        mlm_preds.append(accelerator.gather(precompute_logits(outputs.logits, k=5)).cpu().numpy())
-        mlm_labels.append(accelerator.gather(batch["labels"]).cpu().numpy())
-        secondary_logits.append(accelerator.gather(outputs.secondary_logits).cpu().numpy())
+            ae_input, ae_output = model(batch['embedding'])
+            loss = loss_fct(ae_output, ae_input)
+        
+        test_losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
         log_labels.append(accelerator.gather(batch["log_labels"]).cpu().numpy())
 
-    mlm_preds = np.concatenate(mlm_preds)
-    mlm_labels = np.concatenate(mlm_labels)
-    secondary_logits = np.concatenate(secondary_logits)
+    def compute_for_metrics(test_logits, log_labels, best_threshold):
+        # Define the implementation of the compute_for_metrics function here
+        best_f1 = 0
+        best_precision = 0
+        best_recall = 0
+        i = 0
+        for i in range(1, 10):
+            preds = []
+            for logit in test_logits:
+                if logit > i * best_threshold:
+                    preds.append(1)
+                else:
+                    preds.append(0)
+            f1 = f1_score(log_labels, preds)
+            if f1 > best_f1:
+                best_f1 = f1
+                best_precision = precision_score(log_labels, preds)
+                best_recall = recall_score(log_labels, preds)
+
+        return {"f1": best_f1, "precision": best_precision, "recall": best_recall, "threshold": best_threshold, "i": i}
+
+    test_losses = torch.cat(test_losses).cpu().numpy()
     log_labels = np.concatenate(log_labels)
-    results = compute_metrics_for_test(mlm_preds, mlm_labels, secondary_logits, log_labels)
+    results = compute_for_metrics(test_losses, log_labels, best_threshold=best_threshold)
     logger.info(f"{results}")
 
     if args.with_tracking:
         accelerator.end_training()
 
-    if args.output_dir is not None:
-        accelerator.wait_for_everyone()
-        unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.save_pretrained(
-            args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save, safe_serialization=False
-        )
+    # if args.output_dir is not None:
+    #     accelerator.wait_for_everyone()
+    #     unwrapped_model = accelerator.unwrap_model(model)
+        # unwrapped_model.save_pretrained(
+        #     args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save, safe_serialization=False
+        # )
         # if accelerator.is_main_process:
         #     tokenizer.save_pretrained(args.output_dir)
         #     if args.push_to_hub:
         #         repo.push_to_hub(commit_message="End of training", auto_lfs_prune=True)
 
-        with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
-            # json.dump({"perplexity": perplexity}, f)
-            json.dump(results, f)
+        # with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
+        #     # json.dump({"perplexity": perplexity}, f)
+        #     json.dump(results, f)
 
 
 if __name__ == "__main__":

@@ -16,6 +16,6 @@ accelerate launch --main_process_port $main_process_port scripts/run_clm_no_trai
     --validation_split_percentage 10 \
     --checkpointing_steps epoch \
     --preprocessing_num_workers 1 \
-    --max_train_samples ${NUM_SAMPLES} \
-    --max_eval_samples ${NUM_SAMPLES} \
-    --max_test_samples ${NUM_SAMPLES} \
+    # --max_train_samples ${NUM_SAMPLES} \
+    # --max_eval_samples ${NUM_SAMPLES} \
+    # --max_test_samples ${NUM_SAMPLES} \
