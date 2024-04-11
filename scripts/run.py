@@ -431,26 +431,29 @@ def main():
         max_seq_length = min(args.max_seq_length, tokenizer.model_max_length)
     
     encoder.to(accelerator.device)
-
+    
     # Create dict of embeddings
     template_embeddings = None
     if args.template_path is not None:
-        # Read the CSV file
-        templates_df = pd.read_csv(args.template_path)
 
-        # For each template, tokenize and get the embeddings
-        template_embeddings = {}
-        for eventId, eventTemplate in zip(templates_df['EventId'], templates_df['EventTemplate']):
-            # Tokenize
-            input_ids = tokenizer.encode(eventTemplate, truncation=True, max_length=max_seq_length, return_tensors="pt")
-            # Get embeddings
-            with torch.no_grad():
-                template_embeddings[eventId] = (encoder(input_ids=input_ids.to(accelerator.device)).last_hidden_state[:, 0, :].squeeze(0).detach().cpu())
+        if accelerator.is_main_process:
+            # Read the CSV file
+            templates_df = pd.read_csv(args.template_path)
+
+            # For each template, tokenize and get the embeddings
+            template_embeddings = {}
+            for eventId, eventTemplate in zip(templates_df['EventId'], templates_df['EventTemplate']):
+                # Tokenize
+                input_ids = tokenizer.encode(eventTemplate, truncation=True, max_length=max_seq_length, return_tensors="pt")
+                # Get embeddings
+                with torch.no_grad():
+                    template_embeddings[eventId] = (encoder(input_ids=input_ids.to(accelerator.device)).last_hidden_state[:, 0, :].squeeze(0).detach().cpu())
+            
+            # Save the embeddings
+            with open(args.output_dir + "/embeddings.pkl", "wb") as f:
+                pickle.dump(template_embeddings, f)
         
-        # Save the embeddings
-        with open(args.output_dir + "/embeddings.pkl", "wb") as f:
-            pickle.dump(template_embeddings, f)
-        
+        accelerator.wait_for_everyone()
         # Load the embeddings
         with open(args.output_dir + "/embeddings.pkl", "rb") as f:
             template_embeddings = pickle.load(f)
@@ -842,7 +845,7 @@ def main():
             loss = loss_fct(ae_output, ae_input)
         
         test_losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
-        log_labels.append(accelerator.gather(batch["log_labels"]).cpu().numpy())
+        log_labels.append(accelerator.gather_for_metrics(batch["log_labels"]).cpu().numpy())
 
     def compute_for_metrics(test_logits, log_labels, best_threshold):
         # Define the implementation of the compute_for_metrics function here
@@ -857,6 +860,7 @@ def main():
                     preds.append(1)
                 else:
                     preds.append(0)
+            print(len(log_labels), len(preds))
             f1 = f1_score(log_labels, preds)
             if f1 > best_f1:
                 best_f1 = f1

@@ -1,4 +1,4 @@
-DATASET_NAME=BGL
+DATASET_NAME=HDFS
 main_process_port=$(( $RANDOM % 10 + 29500 ))
 echo "Main process port: $main_process_port"
 
@@ -10,7 +10,7 @@ accelerate launch --main_process_port $main_process_port scripts/run.py \
     --test_path ../dataset/${DATASET_NAME}/test.pkl \
     --per_device_train_batch_size 128 \
     --per_device_eval_batch_size 128 \
-    --num_train_epochs 100 \
+    --num_train_epochs 1 \
     --output_dir outputs/${DATASET_NAME} \
     --model_name_or_path ./model \
     --trust_remote_code true \
@@ -22,7 +22,8 @@ accelerate launch --main_process_port $main_process_port scripts/run.py \
     --preprocessing_num_workers 1 \
     --early_stopping_patience 100 \
     --encoder_name_or_path ${TRANSFORMER} \
-    --max_train_samples ${NUM_SAMPLES} \
-    --max_eval_samples ${NUM_SAMPLES} \
-    --max_test_samples ${NUM_SAMPLES} \
-    # --template_path ../dataset/${DATASET_NAME}/${DATASET_NAME}.log_templates.csv \
+    --template_path ../dataset/${DATASET_NAME}/${DATASET_NAME}.log_templates.csv \
+    # --max_train_samples ${NUM_SAMPLES} \
+    # --max_eval_samples ${NUM_SAMPLES} \
+    # --max_test_samples ${NUM_SAMPLES} \
+

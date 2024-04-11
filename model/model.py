@@ -1,10 +1,6 @@
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.autograd import Variable
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
 
 class AutoEncoder(nn.Module):
     #Multi layers (max 5) autoencoder with dropout 0.1 and LeakyRELU() activation

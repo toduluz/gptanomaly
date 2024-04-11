@@ -55,4 +55,4 @@ srun whichgpu
 # pip3 install -r requirements.txt
 
 # Submit your job to the cluster
-srun --gres=gpu:4 bash run_clm.sh
+srun --gres=gpu:4 bash run_mlmlog.sh
