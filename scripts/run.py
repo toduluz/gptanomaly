@@ -466,22 +466,24 @@ def main():
             batch = dict()
 
             if template_embeddings is not None:
-                # Get the embeddings for the event templates
-                embeddings = []
-                for eventIds in examples['EventId']:
-                    sent_embeddings = torch.stack([template_embeddings[eventId] for eventId in eventIds])
-                    embeddings.append(sent_embeddings)
-                batch['embedding'] = embeddings
-            else:
-                batch['inputs'] = [tokenizer(text, truncation=True, padding=padding, max_length=max_seq_length, return_tensors="pt") for text in examples[text_column_name]]
-                embeddings = []
-                with torch.no_grad():
-                    for input in batch['inputs']:
-                        input.to(accelerator.device)
-                        embedding = encoder(input_ids=input['input_ids'], attention_mask=input['attention_mask']).last_hidden_state[:, 0, :].squeeze(0).detach().cpu()
-                        embeddings.append(embedding)
-                batch['embedding'] = embeddings
-                del batch['inputs']
+                # Get the eventId to convert to embeddings later on
+                batch['EventId'] = examples['EventId'] 
+            #     # Get the embeddings for the event templates
+            #     embeddings = []
+            #     for eventIds in examples['EventId']:
+            #         sent_embeddings = torch.stack([template_embeddings[eventId] for eventId in eventIds])
+            #         embeddings.append(sent_embeddings)
+            #     batch['embedding'] = embeddings
+            # else:
+            #     batch['inputs'] = [tokenizer(text, truncation=True, padding=padding, max_length=max_seq_length, return_tensors="pt") for text in examples[text_column_name]]
+            #     embeddings = []
+            #     with torch.no_grad():
+            #         for input in batch['inputs']:
+            #             input.to(accelerator.device)
+            #             embedding = encoder(input_ids=input['input_ids'], attention_mask=input['attention_mask']).last_hidden_state[:, 0, :].squeeze(0).detach().cpu()
+            #             embeddings.append(embedding)
+            #     batch['embedding'] = embeddings
+            #     del batch['inputs']
             
             batch['log_labels'] = examples['Label']
 
@@ -568,11 +570,22 @@ def main():
     def collate_fn(batch):
         output = {}
         for key in batch[0].keys():
-            if key == 'embedding':
-                # Pad!
-                max_length = max([len(x[key]) for x in batch])
+            # if key == 'embedding':
+            #     # Pad!
+            #     max_length = max([len(x[key]) for x in batch])
                 
-                padded_batch = [torch.cat((torch.tensor(x[key]), torch.zeros(max_length - len(x[key]), len(x[key][0])))) if len(x[key]) < max_length else torch.tensor(x[key]) for x in batch]
+            #     padded_batch = [torch.cat((torch.tensor(x[key]), torch.zeros(max_length - len(x[key]), len(x[key][0])))) if len(x[key]) < max_length else torch.tensor(x[key]) for x in batch]
+            #     output[key] = torch.stack(padded_batch)
+            if key == 'eventIds':
+                # Convert to embeddings
+                embeddings = []
+                for eventIds in batch[key]:
+                    sent_embeddings = torch.stack([template_embeddings[eventId] for eventId in eventIds])
+                    embeddings.append(sent_embeddings)
+                
+                # Pad!
+                max_length = max([len(x) for x in embeddings])
+                padded_batch = [torch.cat((x, torch.zeros(max_length - len(x), len(x[0]))) if len(x) < max_length else x) for x in embeddings]
                 output[key] = torch.stack(padded_batch)
             else:
                 output[key] = torch.stack([torch.tensor(x[key]) for x in batch])
