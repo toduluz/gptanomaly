@@ -437,12 +437,26 @@ def main():
                 if i not in index_to_exclude:
                     ls.append(row[i])
             
-            return 'Example of log sequence with wrong ordering of logs:' + ' '.join(ls) + '.' + 'The sequence is missing log templates in positions ' + ' '.join([str(x) for x in index_to_exclude]) + '.'
+            return 'Example of log sequence with wrong ordering of logs: ' + ' '.join(ls) + '.' + 'The sequence is missing log templates in positions ' + ' '.join([str(x) for x in index_to_exclude]) + '.'
+        
+        def get_shuffled_event_template(row):
+            # Shuffle the row
+            random.shuffle(row)
+
+            return 'They also should not be ordered as follow due to shuffling of the log templates. Example of log sequence with wrong ordering of logs due to shuffling: ' + ' '.join(row) + '.'
+
                     
         if args.train_path is not None:
             with open(args.train_path, "rb") as f:
                 train_data = pickle.load(f)
-                train_df = pd.DataFrame(train_data)
+                df = pd.DataFrame(train_data)
+
+                train_df, val_df = train_test_split(df, test_size=args.validation_split_percentage / 100, random_state=args.seed)
+
+                if args.max_train_samples is not None:
+                    train_df = train_df.head(args.max_train_samples)
+                if args.max_eval_samples is not None:
+                    val_df = val_df.head(args.max_eval_samples)
     
                 # Check if 'label' column contains lists
                 if train_df['Label'].apply(isinstance, args=(list,)).all():
@@ -454,18 +468,36 @@ def main():
                 train_df['VocabIndexAnomaly1'] = train_df['VocabIndex'].apply(lambda x: get_masked_event_template(x, 0.15))
                 train_df['VocabIndexAnomaly2'] = train_df['VocabIndex'].apply(lambda x: get_masked_event_template(x, 0.15))
                 train_df['VocabIndexAnomaly3'] = train_df['VocabIndex'].apply(lambda x: get_masked_event_template(x, 0.15))
+                # train_df['VocabIndexShuffle'] = train_df['VocabIndex'].apply(get_shuffled_event_template)
                 
                 # Join the list into text
                 train_df['text'] = train_df['EventTemplate'].apply(' '.join)
                 # Add text in front of text
                 train_df['text'] = 'The following is a log sequence containing multiple log templates: ' + train_df['text'] + '. ' + 'Using numbers to represent each log template, the log sequence contains log templates ordered as such: ' + train_df['VocabIndexCorrectText'] + ". They should not be ordered as the following due to deletion to the log templates." \
-                + train_df['VocabIndexAnomaly1'] + train_df['VocabIndexAnomaly2'] + train_df['VocabIndexAnomaly3']
+                + train_df['VocabIndexAnomaly1'] + train_df['VocabIndexAnomaly2'] + train_df['VocabIndexAnomaly3'] # + train_df['VocabIndexShuffle']
                 # Only get normal samples
                 train_df = train_df[train_df['Label'] == 0]
+
+                if val_df['Label'].apply(isinstance, args=(list,)).all():
+                    # Find the max of each list in the 'label' column
+                    val_df['Label'] = val_df['Label'].apply(max)
+                # Convert 'EventTemplate' to Vocab index
+                val_df['VocabIndex'] = val_df['EventTemplate'].apply(lambda x: [str(vocab.get_event(event)) for event in x])
+                val_df['VocabIndex'] = val_df['VocabIndex'].apply(' '.join)
+                
+                # Join the list into text
+                val_df['text'] = val_df['EventTemplate'].apply(' '.join)
+                # Add text in front of text
+                val_df['text'] = 'The following is a log sequence containing multiple log templates: ' + val_df['text'] + '. ' + 'Using numbers to represent each log template, the log sequence contains log templates ordered as: '
+
         if args.test_path is not None:
             with open(args.test_path, "rb") as f:
                 test_data = pickle.load(f)
                 test_df = pd.DataFrame(test_data)
+
+                if args.max_test_samples is not None:
+                    test_df = test_df.head(args.max_test_samples)
+
                 # Check if 'label' column contains lists
                 if test_df['Label'].apply(isinstance, args=(list,)).all():
                     # Find the max of each list in the 'label' column
@@ -479,21 +511,10 @@ def main():
                 # Add text in front of text
                 test_df['text'] = 'The following is a log sequence containing multiple log templates: ' + test_df['text'] + '. ' + 'Using numbers to represent each log template, the log sequence contains log templates ordered as: '
 
-        # Split the training data into training and validation
-        train_df, val_df = train_test_split(train_df, test_size=args.validation_split_percentage / 100, shuffle=False)
-        # val_df = val_df[val_df['Label'] == 0]
-
-        # Set the max number of samples for training and validation and test 
-        if args.max_train_samples is not None:
-            train_df = train_df.head(args.max_train_samples)
-        if args.max_eval_samples is not None:
-            val_df = val_df.head(args.max_eval_samples)
-        if args.max_test_samples is not None:
-            test_df = test_df.head(args.max_test_samples)
-
         raw_datasets = datasets.dataset_dict.DatasetDict()
         raw_datasets['train'] = datasets.Dataset.from_pandas(train_df)
-        raw_datasets['validation'] = datasets.Dataset.from_pandas(val_df)
+        
+        raw_val_dataset = datasets.Dataset.from_pandas(val_df)
 
         raw_test_dataset = datasets.Dataset.from_pandas(test_df)
 
@@ -619,10 +640,7 @@ def main():
         )
 
     train_dataset = lm_datasets["train"]
-    eval_dataset = lm_datasets["validation"]
 
-    column_names = raw_test_dataset.column_names
-    text_column_name = "text"
     def truncate_sentences(examples):
         vocab_index = tokenizer(examples['VocabIndex'], truncation=True, max_length=block_size)['input_ids']
         max_length_for_test = block_size - len(vocab_index)
@@ -632,6 +650,22 @@ def main():
         batch["labels"] = batch["input_ids"].copy()
 
         return batch
+
+    column_names = raw_val_dataset.column_names
+    text_column_name = "text"
+
+    with accelerator.main_process_first():
+        eval_dataset = raw_val_dataset.map(
+            truncate_sentences,
+            batched=True,
+            num_proc=args.preprocessing_num_workers,
+             remove_columns=column_names,
+            load_from_cache_file=not args.overwrite_cache,
+            desc="Truncating sentences to block size for val_dataset",
+        )
+
+    column_names = raw_test_dataset.column_names
+    text_column_name = "text"
 
     with accelerator.main_process_first():
         test_dataset = raw_test_dataset.map(
@@ -646,6 +680,41 @@ def main():
     # Log a few random samples from the training set:
     for index in random.sample(range(len(train_dataset)), 3):
         logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
+    
+    def compute_metrics(matches, labels, b_threshold = None):
+        best_f1 = 0
+        best_precision = 0
+        best_recall = 0
+        best_threshold = b_threshold
+        average_of_matches = np.mean(matches)
+        
+        if b_threshold is None:
+            for threshold in np.arange(0, 1, 0.01):
+                predictions = []
+                for match in matches:
+                    predictions.append(1 if match < threshold else 0)
+                f1 = f1_score(labels, predictions, zero_division=0)
+                if f1 > best_f1:
+                    best_f1 = f1
+                    best_precision = precision_score(labels, predictions, zero_division=0)
+                    best_recall = recall_score(labels, predictions, zero_division=0)
+                    best_threshold = threshold
+        else:
+            predictions = []
+            for match in matches:
+                predictions.append(1 if match < best_threshold else 0)
+            best_f1 = f1_score(labels, predictions, zero_division=0)
+            best_precision = precision_score(labels, predictions, zero_division=0)
+            best_recall = recall_score(labels, predictions, zero_division=0)
+
+       
+        return {
+            "f1": best_f1,
+            "precision": best_precision,
+            "recall": best_recall,
+            "threshold": best_threshold,
+            "average": average_of_matches
+        }
 
     # DataLoaders creation:
     train_dataloader = DataLoader(
@@ -766,8 +835,11 @@ def main():
     # update the progress_bar if load from checkpoint
     progress_bar.update(completed_steps)
 
-    difference = 0
-    ratio = 0
+    best_k = 0
+    best_result = 0
+    best_epoch = None
+    best_threshold = None
+
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
         if args.with_tracking:
@@ -804,37 +876,58 @@ def main():
                 break
 
         model.eval()
-        losses = []
+        labels = []
+        K = [x for x in range(1, 100)]
+        predictions = [[] for _ in range(1, 100)]
         for step, batch in enumerate(eval_dataloader):
-            with torch.no_grad():
-                outputs = model(**batch)
+            # Initialize a list of lists for the matches
+            matches = [[] for _ in range(1, 100)]
+            vocab_len = batch['vocab_index'].shape[1]
+            for i in range(vocab_len):
+                
+                # Generate next token
+                with torch.no_grad():
+                    outputs = model(batch['input_ids'], attention_mask=batch['attention_mask'])
+                    logits = outputs.logits
 
-            loss = outputs.loss
-            losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
+                # Get the last prediction
+                # print(batch['input_ids'].shape, logits.shape)
+                next_token_logits = logits[:, -1, :]
+                for k in K:
+                    next_token_id = torch.topk(next_token_logits, k).indices
 
-        losses = torch.cat(losses)
+                    # Check if vocab index is in the next token in pytorch tensor
+                    match = next_token_id == batch['vocab_index'][:, i].expand_as(next_token_id)
+                    # print(match.shape)
 
-        try:
-            eval_loss = torch.mean(losses)
-            perplexity = math.exp(eval_loss)
+                    # Get 1 if any true
+                    match = match.any(dim=-1).float()
+                    # print(match)
+                    matches[k-1].append(match)
+                
+                # Append next token to input_ids
+                # batch['input_ids'] = torch.cat([batch['input_ids'], batch['vocab_index'][:, i].unsqueeze(0)], dim=1)
+                batch['input_ids'] = torch.cat([batch['input_ids'], torch.argmax(next_token_logits, dim=-1).unsqueeze(1)], dim=1)
+                batch['attention_mask'] = torch.cat([batch['attention_mask'], torch.ones((batch['attention_mask'].shape[0], 1), device=accelerator.device)], dim=1)
 
-        except OverflowError:
-            perplexity = float("inf")
-            baseline_perplexity = float("inf")
+            for k in K:
+                average_matches = torch.sum(torch.cat(matches[k-1])) / vocab_len
+                predictions[k-1].append(accelerator.gather_for_metrics(average_matches).cpu().numpy())
 
-        logger.info(f"epoch {epoch}: perplexity: {perplexity} eval_loss: {eval_loss}")
+            labels.append(accelerator.gather_for_metrics(batch["log_labels"]).cpu().numpy())
 
-        if args.with_tracking:
-            accelerator.log(
-                {
-                    "perplexity": perplexity,
-                    "eval_loss": eval_loss,
-                    "train_loss": total_loss.item() / len(train_dataloader),
-                    "epoch": epoch,
-                    "step": completed_steps,
-                },
-                step=completed_steps,
-            )
+        labels = np.concatenate(labels)
+        for k in K:
+            # predictions[k-1] = np.concatenate(predictions[k-1])
+            results = compute_metrics(predictions[k-1], labels)
+            if results['f1'] > best_result:
+                best_result = results['f1']
+                best_k = k
+                best_epoch = epoch
+                best_threshold = results['threshold']
+            logger.info(f"Validation results: {results} for k = {k} at epoch {epoch} with threshold {results['threshold']}")
+        
+        logger.info(f"Best f1 result: {best_result} for k = {best_k} at epoch {best_epoch} with threshold {best_threshold}")
 
         if args.push_to_hub and epoch < args.num_train_epochs - 1:
             accelerator.wait_for_everyone()
@@ -856,7 +949,7 @@ def main():
             output_dir = f"epoch_{epoch}"
             if args.output_dir is not None:
                 output_dir = os.path.join(args.output_dir, output_dir)
-            accelerator.save_state(output_dir)
+            accelerator.save_state(output_dir, safe_serialization=False)
 
     if args.with_tracking:
         accelerator.end_training()
@@ -881,38 +974,16 @@ def main():
             #     json.dump({"perplexity": perplexity}, f)
     
     ### Test the model ###
+    ### Load the best model ###
+    if best_epoch is not None:
+        checkpoint_path = args.output_dir + f"/epoch_{best_epoch}"
+        accelerator.load_state(checkpoint_path)
+
     model.eval()
-    def compute_metrics(matches, labels):
-        best_f1 = 0
-        best_precision = 0
-        best_recall = 0
-        best_threshold = 0
-        average_of_matches = np.mean(matches)
-        # print(len(matches), len(labels))
-        for threshold in np.arange(0, 1, 0.01):
-            predictions = []
-            for match in matches:
-                predictions.append(1 if match < threshold else 0)
-            f1 = f1_score(labels, predictions, zero_division=0)
-            if f1 > best_f1:
-                best_f1 = f1
-                best_precision = precision_score(labels, predictions, zero_division=0)
-                best_recall = recall_score(labels, predictions, zero_division=0)
-                best_threshold = threshold
-       
-        return {
-            "f1": best_f1,
-            "precision": best_precision,
-            "recall": best_recall,
-            "threshold": best_threshold,
-            "average": average_of_matches
-        }
-
-
-
+   
     labels = []
     predictions = []
-    K = 50
+    test_K = best_k
     for step, batch in enumerate(test_dataloader):
 
         matches = []
@@ -927,7 +998,7 @@ def main():
             # Get the last prediction
             # print(batch['input_ids'].shape, logits.shape)
             next_token_logits = logits[:, -1, :]
-            next_token_id = torch.topk(next_token_logits, K).indices
+            next_token_id = torch.topk(next_token_logits, test_K).indices
 
             # Check if vocab index is in the next token in pytorch tensor
             match = next_token_id == batch['vocab_index'][:, i].expand_as(next_token_id)
@@ -939,16 +1010,12 @@ def main():
             matches.append(match)
             
             # Append next token to input_ids
-            # batch['input_ids'] = torch.cat([batch['input_ids'], batch['vocab_index'][:, i].unsqueeze(0)], dim=1)
-            batch['input_ids'] = torch.cat([batch['input_ids'], torch.argmax(next_token_logits, dim=-1).unsqueeze(1)], dim=1)
+            batch['input_ids'] = torch.cat([batch['input_ids'], batch['vocab_index'][:, i].unsqueeze(0)], dim=1)
+            # batch['input_ids'] = torch.cat([batch['input_ids'], torch.argmax(next_token_logits, dim=-1).unsqueeze(1)], dim=1)
             batch['attention_mask'] = torch.cat([batch['attention_mask'], torch.ones((batch['attention_mask'].shape[0], 1), device=accelerator.device)], dim=1)
 
 
         average_matches = torch.sum(torch.cat(matches)) / vocab_len
-        # print(average_matches)
-
-        # Convert to tensor
-        # average_matches = torch.tensor(average_matches, device=accelerator.device)
 
         predictions.append(accelerator.gather(average_matches).cpu().numpy())
         labels.append(accelerator.gather(batch["log_labels"]).cpu().numpy())
@@ -957,7 +1024,7 @@ def main():
     # predictions = np.concatenate(predictions)
     labels = np.concatenate(labels)
 
-    results = compute_metrics(predictions, labels)
+    results = compute_metrics(predictions, labels, best_threshold)
     logger.info(f"Test results: {results}")
 
 
