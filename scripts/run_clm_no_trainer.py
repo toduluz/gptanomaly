@@ -424,6 +424,21 @@ def main():
         #         split=f"train[{args.validation_split_percentage}%:]",
         #         **dataset_args,
         #     )
+        def get_masked_event_template(row, prob=0.15):
+            # Get the total length of the list
+            length = len(row)
+            #Choose 20% of the list to exclude
+            num_to_exclude = int(length * prob)
+            # Randomly choose the index to exclude
+            index_to_exclude = random.sample(range(length), num_to_exclude)
+
+            ls = []
+            for i in range(length):
+                if i not in index_to_exclude:
+                    ls.append(row[i])
+            
+            return 'Example of log sequence with wrong ordering of logs:' + ' '.join(ls) + '.' + 'The sequence is missing log templates in positions ' + ' '.join([str(x) for x in index_to_exclude]) + '.'
+                    
         if args.train_path is not None:
             with open(args.train_path, "rb") as f:
                 train_data = pickle.load(f)
@@ -435,11 +450,16 @@ def main():
                     train_df['Label'] = train_df['Label'].apply(max)
                 # Convert 'EventTemplate' to Vocab index for each item in the list in 'EventTemplate'
                 train_df['VocabIndex'] = train_df['EventTemplate'].apply(lambda x: [str(vocab.get_event(event)) for event in x])
-                train_df['VocabIndex'] = train_df['VocabIndex'].apply(' '.join)
+                train_df['VocabIndexCorrectText'] = train_df['VocabIndex'].apply(' '.join)
+                train_df['VocabIndexAnomaly1'] = train_df['VocabIndex'].apply(lambda x: get_masked_event_template(x, 0.15))
+                train_df['VocabIndexAnomaly2'] = train_df['VocabIndex'].apply(lambda x: get_masked_event_template(x, 0.15))
+                train_df['VocabIndexAnomaly3'] = train_df['VocabIndex'].apply(lambda x: get_masked_event_template(x, 0.15))
+                
                 # Join the list into text
                 train_df['text'] = train_df['EventTemplate'].apply(' '.join)
                 # Add text in front of text
-                train_df['text'] = 'The following is the log sequence: ' + train_df['text'] + '. ' + 'The log templates are: ' + train_df['VocabIndex']
+                train_df['text'] = 'The following is a log sequence containing multiple log templates: ' + train_df['text'] + '. ' + 'Using numbers to represent each log template, the log sequence contains log templates ordered as such: ' + train_df['VocabIndexCorrectText'] + ". They should not be ordered as the following due to deletion to the log templates." \
+                + train_df['VocabIndexAnomaly1'] + train_df['VocabIndexAnomaly2'] + train_df['VocabIndexAnomaly3']
                 # Only get normal samples
                 train_df = train_df[train_df['Label'] == 0]
         if args.test_path is not None:
@@ -457,7 +477,7 @@ def main():
                 # Join the list into text
                 test_df['text'] = test_df['EventTemplate'].apply(' '.join)
                 # Add text in front of text
-                test_df['text'] = 'The following is the log sequence: ' + test_df['text'] + '. ' + 'The log templates are: '
+                test_df['text'] = 'The following is a log sequence containing multiple log templates: ' + test_df['text'] + '. ' + 'Using numbers to represent each log template, the log sequence contains log templates ordered as: '
 
         # Split the training data into training and validation
         train_df, val_df = train_test_split(train_df, test_size=args.validation_split_percentage / 100, shuffle=False)
@@ -511,6 +531,7 @@ def main():
             "You are instantiating a new tokenizer from scratch. This is not supported by this script. "
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
+    tokenizer.truncation_side = "left"
 
     if args.model_name_or_path:
         model = AutoModelForCausalLM.from_pretrained(
@@ -868,7 +889,7 @@ def main():
         best_threshold = 0
         average_of_matches = np.mean(matches)
         # print(len(matches), len(labels))
-        for threshold in np.arange(0, 1, 0.1):
+        for threshold in np.arange(0, 1, 0.01):
             predictions = []
             for match in matches:
                 predictions.append(1 if match < threshold else 0)
@@ -891,7 +912,7 @@ def main():
 
     labels = []
     predictions = []
-    K = 5
+    K = 50
     for step, batch in enumerate(test_dataloader):
 
         matches = []
@@ -918,7 +939,8 @@ def main():
             matches.append(match)
             
             # Append next token to input_ids
-            batch['input_ids'] = torch.cat([batch['input_ids'], batch['vocab_index'][:, i].unsqueeze(0)], dim=1)
+            # batch['input_ids'] = torch.cat([batch['input_ids'], batch['vocab_index'][:, i].unsqueeze(0)], dim=1)
+            batch['input_ids'] = torch.cat([batch['input_ids'], torch.argmax(next_token_logits, dim=-1).unsqueeze(1)], dim=1)
             batch['attention_mask'] = torch.cat([batch['attention_mask'], torch.ones((batch['attention_mask'].shape[0], 1), device=accelerator.device)], dim=1)
 
 

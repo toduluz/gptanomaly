@@ -54,7 +54,7 @@ class BiLSTM_Attention(nn.Module):
         # self.embedding = nn.Embedding(vocab_size, embedding_dim)
         self.lstm = nn.LSTM(embedding_dim, n_hidden, bidirectional=True, dropout=0.1, batch_first=True, num_layers=10)
         self.out = nn.Linear(n_hidden * 2, n_hidden)
-        self.ae = AutoEncoder(n_hidden, n_hidden//2, n_hidden)
+        # self.ae = AutoEncoder(n_hidden, n_hidden//2, n_hidden)
 
     # lstm_output : [batch_size, n_step, n_hidden * num_directions(=2)], F matrix
     def attention_net(self, lstm_output, final_state, n_hidden = 768):
@@ -76,10 +76,10 @@ class BiLSTM_Attention(nn.Module):
         output, (final_hidden_state, final_cell_state) = self.lstm(X)
         # output = output.permute(1, 0, 2) # output : [batch_size, len_seq, n_hidden]
         attn_output, attention = self.attention_net(output, final_hidden_state[-2:], n_hidden)
-        ae_input = self.out(attn_output) # model : [batch_size, num_classes], attention : [batch_size, n_step]
+        return self.out(attn_output) # model : [batch_size, num_classes], attention : [batch_size, n_step]
         # Normalize
-        ae_input = F.normalize(ae_input, p=2, dim=1)
-        ae_output = self.ae(ae_input)
-        return ae_input, ae_output
+        # ae_input = F.normalize(ae_input, p=2, dim=1)
+        # ae_output = self.ae(ae_input)
+        # return ae_input, ae_output
 
 

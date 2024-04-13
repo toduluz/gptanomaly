@@ -10,12 +10,12 @@ accelerate launch --main_process_port $main_process_port scripts/run_clm_no_trai
     --log_template_file ../dataset/${DATASET_NAME}/${DATASET_NAME}.log_structured.csv \
     --per_device_train_batch_size 2 \
     --per_device_eval_batch_size 2 \
-    --num_train_epochs 10 \
+    --num_train_epochs 3 \
     --output_dir outputs/${DATASET_NAME} \
     --model_name_or_path gpt2 \
     --validation_split_percentage 10 \
     --checkpointing_steps epoch \
     --preprocessing_num_workers 1 \
-    # --max_train_samples ${NUM_SAMPLES} \
-    # --max_eval_samples ${NUM_SAMPLES} \
-    # --max_test_samples ${NUM_SAMPLES} \
+    --max_train_samples ${NUM_SAMPLES} \
+    --max_eval_samples ${NUM_SAMPLES} \
+    --max_test_samples ${NUM_SAMPLES} \

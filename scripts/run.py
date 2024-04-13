@@ -36,7 +36,7 @@ from transformers import (
 )
 from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
-from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score
+from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score
 import numpy as np
 
 
@@ -111,7 +111,7 @@ def parse_args():
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=5e-5,
+        default=1e-5,
         help="Initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay to use.")
@@ -576,20 +576,19 @@ def main():
                 
             #     padded_batch = [torch.cat((torch.tensor(x[key]), torch.zeros(max_length - len(x[key]), len(x[key][0])))) if len(x[key]) < max_length else torch.tensor(x[key]) for x in batch]
             #     output[key] = torch.stack(padded_batch)
-            if key == 'eventIds':
+            if key == 'EventId':
                 # Convert to embeddings
                 embeddings = []
-                for eventIds in batch[key]:
-                    sent_embeddings = torch.stack([template_embeddings[eventId] for eventId in eventIds])
+                for b in batch:
+                    sent_embeddings = torch.stack([template_embeddings[eventId] for eventId in b[key]])
                     embeddings.append(sent_embeddings)
                 
                 # Pad!
-                max_length = max([len(x) for x in embeddings])
-                padded_batch = [torch.cat((x, torch.zeros(max_length - len(x), len(x[0]))) if len(x) < max_length else x) for x in embeddings]
-                output[key] = torch.stack(padded_batch)
+                max_length = max([x.shape[0] for x in embeddings])
+                padded_batch = [torch.cat((x, torch.zeros(max_length - x.shape[0], x.shape[1]))) if len(x) < max_length else x for x in embeddings]
+                output['embedding'] = torch.stack(padded_batch)
             else:
                 output[key] = torch.stack([torch.tensor(x[key]) for x in batch])
-
         # Generate the last of the 
         return output
 
@@ -718,9 +717,33 @@ def main():
     best_loss = float("inf")
     best_epoch = None
     loss_fct = nn.MSELoss()
+    best_center = None
+
+
+    def get_radius(dist: list, nu: float = 0.2):
+        """Optimally solve for radius R via the (1-nu)-quantile of distances."""
+        return np.quantile(np.sqrt(dist), 1 - nu)
+
 
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
+
+        # Get center from both traindataloader and evaldataloader
+        center = 0
+        total_samples = 0
+        for step, batch in enumerate(train_dataloader):
+            with torch.no_grad():
+                ae_output = model(batch['embedding'])
+            # print(ae_output.shape)
+            center += torch.sum(ae_output, dim=0).detach().clone()
+            total_samples += len(batch['embedding'])
+        for step, batch in enumerate(eval_dataloader):
+            with torch.no_grad():
+                ae_output = model(batch['embedding'])
+            center += torch.sum(ae_output, dim=0).detach().clone()
+            total_samples += len(batch['embedding'])
+        center /= total_samples
+        print(center.shape)
 
         total_loss = 0
         if args.with_tracking:
@@ -730,12 +753,20 @@ def main():
             active_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
         else:
             active_dataloader = train_dataloader
-        
+
+        dists = []
         for step, batch in enumerate(active_dataloader):
             with accelerator.accumulate(model):
-                ae_input, ae_output = model(batch['embedding'])
-                loss = loss_fct(ae_output, ae_input)
                 
+
+                ae_output = model(batch['embedding'])
+                # L2 loss between output and center
+                # loss = loss_fct(ae_output, ae_input) * 0.1
+                loss = loss_fct(ae_output, center.expand_as(ae_output))
+                dist =  torch.sqrt(torch.sum((ae_output - center) ** 2, dim=1))
+            
+                dists.append(accelerator.gather_for_metrics(dist.detach().clone()))
+
                 # We keep track of the loss at each epoch
                 total_loss += loss.detach().float()
                 if args.with_tracking:
@@ -765,15 +796,20 @@ def main():
 
         model.eval()
         eval_losses = []
+        
         for step, batch in enumerate(eval_dataloader):
             with torch.no_grad():
-               ae_input, ae_output = model(batch['embedding'])
-            loss = loss_fct(ae_output, ae_input)
+               ae_output = model(batch['embedding'])
+            # loss = loss_fct(ae_output, ae_input) * 0.1
+            loss = loss_fct(ae_output, center.expand_as(ae_output))
 
+            dist =  torch.sqrt(torch.sum((ae_output - center) ** 2, dim=1))
+            dists.append(accelerator.gather_for_metrics(dist.detach().clone()))
             eval_losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
 
         losses = torch.cat(eval_losses)
         eval_loss = torch.mean(losses)
+        dists = torch.cat(dists)
         logger.info(f"epoch: {epoch} eval_loss: {eval_loss}")
 
 
@@ -793,10 +829,12 @@ def main():
         if eval_loss < best_loss:
             best_loss = eval_loss
             best_model_dir = f"epoch_{epoch}"
-            best_threshold = eval_loss.item()
+            # print(dists)
+            radius = get_radius(dists.tolist())
+            best_center = center
             # Save the best threshold as pickle
             with open(os.path.join(args.output_dir, "best_threshold.pkl"), "wb") as f:
-                pickle.dump((best_threshold), f)
+                pickle.dump((radius, center), f)
 
             epochs_no_improve = 0
         else:
@@ -846,45 +884,40 @@ def main():
     model.eval()
     # Load best threshold too
     with open(os.path.join(args.output_dir, "best_threshold.pkl"), "rb") as f:
-        best_threshold = pickle.load(f)
+        radius, center = pickle.load(f)
     accelerator.wait_for_everyone()
 
-    test_losses = []
     log_labels = []
+    test_dists = []
 
     for steps, batch in enumerate(test_dataloader):
         with torch.no_grad():
-            ae_input, ae_output = model(batch['embedding'])
-            loss = loss_fct(ae_output, ae_input)
-        
-        test_losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
+            ae_output = model(batch['embedding'])
+        dist =  torch.sqrt(torch.sum((ae_output - center) ** 2, dim=1))
+
+        test_dists.append(accelerator.gather_for_metrics(dist))
         log_labels.append(accelerator.gather_for_metrics(batch["log_labels"]).cpu().numpy())
 
-    def compute_for_metrics(test_logits, log_labels, best_threshold):
-        # Define the implementation of the compute_for_metrics function here
-        best_f1 = 0
-        best_precision = 0
-        best_recall = 0
-        i = 0
-        for i in range(1, 10):
-            preds = []
-            for logit in test_logits:
-                if logit > i * best_threshold:
-                    preds.append(1)
-                else:
-                    preds.append(0)
-            print(len(log_labels), len(preds))
-            f1 = f1_score(log_labels, preds)
-            if f1 > best_f1:
-                best_f1 = f1
-                best_precision = precision_score(log_labels, preds)
-                best_recall = recall_score(log_labels, preds)
 
-        return {"f1": best_f1, "precision": best_precision, "recall": best_recall, "threshold": best_threshold, "i": i}
+    def compute_for_metrics(test_dists, log_labels, radius):
+        """Compute metrics for the test set."""
+        # Compute the metrics
+        y_pred = test_dists > radius
+        y_true = log_labels
+        f1 = f1_score(y_true, y_pred)
+        precision = precision_score(y_true, y_pred)
+        recall = recall_score(y_true, y_pred)
+        accuracy = accuracy_score(y_true, y_pred)
+        return {
+            "f1": f1,
+            "precision": precision,
+            "recall": recall,
+            "accuracy": accuracy,
+        }
 
-    test_losses = torch.cat(test_losses).cpu().numpy()
     log_labels = np.concatenate(log_labels)
-    results = compute_for_metrics(test_losses, log_labels, best_threshold=best_threshold)
+    test_dists = torch.cat(test_dists).cpu().numpy()
+    results = compute_for_metrics(test_dists, log_labels, radius)
     logger.info(f"{results}")
 
     if args.with_tracking:
