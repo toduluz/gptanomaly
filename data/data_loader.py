@@ -119,8 +119,8 @@ if __name__ == '__main__':
         group = "session"
     else:
         group = "sliding"
-    process_dataset(Logger("BGL"),
+    process_dataset(Logger(data),
                     data_dir="../../dataset/"+data, output_dir="../../dataset/"+data, log_file=data+".log",
                     dataset_name=data,
-                    grouping=group, window_size=20, step_size=20, train_size=0.8, is_chronological=True,
+                    grouping=group, window_size=60, step_size=60, train_size=0.8, is_chronological=True,
                     session_type="entry")

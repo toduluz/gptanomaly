@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 import torch.nn as nn
 import torch.nn.functional as F
-from model.model import BiLSTM_Attention
+from model.model import TCN, Similarity
 import transformers
 from transformers import (
     CONFIG_MAPPING,
@@ -38,6 +38,7 @@ from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
 from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score
 import numpy as np
+import info_nce
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -380,7 +381,7 @@ def main():
     
     print("*" * 100)
 
-    model = BiLSTM_Attention(embedding_dim=768, n_hidden=768)
+    model = TCN(768, 768, [512, 256, 128, 64], kernel_size=2, dropout=0.1, emb_dropout=0.1, tied_weights=False)
     # if args.model_name_or_path:
     #     model = AutoModelForMaskedLM.from_pretrained(
     #         args.model_name_or_path,
@@ -717,12 +718,14 @@ def main():
     best_loss = float("inf")
     best_epoch = None
     loss_fct = nn.MSELoss()
+    ctr_sim = Similarity(temp=0.5)
+    ctr_loss = nn.CrossEntropyLoss()
     best_center = None
 
 
     def get_radius(dist: list, nu: float = 0.2):
         """Optimally solve for radius R via the (1-nu)-quantile of distances."""
-        return np.quantile(np.sqrt(dist), 1 - nu)
+        return np.quantile(dist, 1 - nu)
 
 
     for epoch in range(starting_epoch, args.num_train_epochs):
@@ -743,7 +746,7 @@ def main():
             center += torch.sum(ae_output, dim=0).detach().clone()
             total_samples += len(batch['embedding'])
         center /= total_samples
-        print(center.shape)
+        # print(center.shape)
 
         total_loss = 0
         if args.with_tracking:
@@ -760,12 +763,30 @@ def main():
                 
 
                 ae_output = model(batch['embedding'])
+
+                # Calculate the number of elements to zero out
+                num_to_zero_out = int(0.15 * batch['embedding'].shape[1])
+
+                randomly_zeroed_out = torch.randperm(batch['embedding'].shape[1])[:num_to_zero_out]
+
+                # Zero out the elements
+                masked_input = batch['embedding'].clone()
+                masked_input[:, randomly_zeroed_out] = 0
+
+                masked_output = model(masked_input)
+
                 # L2 loss between output and center
                 # loss = loss_fct(ae_output, ae_input) * 0.1
                 loss = loss_fct(ae_output, center.expand_as(ae_output))
                 dist =  torch.sqrt(torch.sum((ae_output - center) ** 2, dim=1))
             
                 dists.append(accelerator.gather_for_metrics(dist.detach().clone()))
+
+                # Contrastive loss
+                cos_sim = ctr_sim(ae_output.unsqueeze(1), masked_output.unsqueeze(0))
+                labe = torch.arange(cos_sim.size(0)).long().to(accelerator.device)
+                c_loss = ctr_loss(cos_sim, labe)
+                loss += c_loss * 0.2
 
                 # We keep track of the loss at each epoch
                 total_loss += loss.detach().float()
@@ -800,8 +821,23 @@ def main():
         for step, batch in enumerate(eval_dataloader):
             with torch.no_grad():
                ae_output = model(batch['embedding'])
+               
+               # Calculate the number of elements to zero out
+               num_to_zero_out = int(0.15 * batch['embedding'].shape[1])
+               randomly_zeroed_out = torch.randperm(batch['embedding'].shape[1])[:num_to_zero_out]
+               # Zero out the elements
+               masked_input = batch['embedding'].clone()
+               masked_input[:, randomly_zeroed_out] = 0
+               masked_output = model(masked_input)
+            #    print(ae_output, masked_output)
             # loss = loss_fct(ae_output, ae_input) * 0.1
             loss = loss_fct(ae_output, center.expand_as(ae_output))
+
+           # Contrastive loss
+            cos_sim = ctr_sim(ae_output.unsqueeze(1), masked_output.unsqueeze(0))
+            labe = torch.arange(cos_sim.size(0)).long().to(accelerator.device)
+            c_loss = ctr_loss(cos_sim, labe)
+            loss += c_loss * 0.2
 
             dist =  torch.sqrt(torch.sum((ae_output - center) ** 2, dim=1))
             dists.append(accelerator.gather_for_metrics(dist.detach().clone()))
@@ -834,7 +870,7 @@ def main():
             best_center = center
             # Save the best threshold as pickle
             with open(os.path.join(args.output_dir, "best_threshold.pkl"), "wb") as f:
-                pickle.dump((radius, center), f)
+                pickle.dump((radius, best_center), f)
 
             epochs_no_improve = 0
         else:

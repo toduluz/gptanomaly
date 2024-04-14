@@ -451,12 +451,10 @@ def main():
                 train_data = pickle.load(f)
                 df = pd.DataFrame(train_data)
 
-                train_df, val_df = train_test_split(df, test_size=args.validation_split_percentage / 100, random_state=args.seed)
-
                 if args.max_train_samples is not None:
-                    train_df = train_df.head(args.max_train_samples)
-                if args.max_eval_samples is not None:
-                    val_df = val_df.head(args.max_eval_samples)
+                    df = df.head(args.max_train_samples)
+
+                train_df, val_df = train_test_split(df, test_size=args.validation_split_percentage / 100, random_state=args.seed)
     
                 # Check if 'label' column contains lists
                 if train_df['Label'].apply(isinstance, args=(list,)).all():

@@ -1,8 +1,8 @@
-DATASET_NAME=HDFS
+DATASET_NAME=BGL
 main_process_port=$(( $RANDOM % 10 + 29500 ))
 echo "Main process port: $main_process_port"
 
-NUM_SAMPLES=500
+NUM_SAMPLES=5000
 TRANSFORMER=roberta-base
 export PYTHONPATH="${PYTHONPATH}:./"
 accelerate launch --main_process_port $main_process_port scripts/run.py \
@@ -10,7 +10,7 @@ accelerate launch --main_process_port $main_process_port scripts/run.py \
     --test_path ../dataset/${DATASET_NAME}/test.pkl \
     --per_device_train_batch_size 64 \
     --per_device_eval_batch_size 64 \
-    --num_train_epochs 40 \
+    --num_train_epochs 10 \
     --output_dir outputs/${DATASET_NAME} \
     --model_name_or_path ./model \
     --trust_remote_code true \
@@ -23,7 +23,7 @@ accelerate launch --main_process_port $main_process_port scripts/run.py \
     --early_stopping_patience 100 \
     --encoder_name_or_path ${TRANSFORMER} \
     --template_path ../dataset/${DATASET_NAME}/${DATASET_NAME}.log_templates.csv \
-    --max_train_samples ${NUM_SAMPLES} \
-    --max_eval_samples ${NUM_SAMPLES} \
-    --max_test_samples ${NUM_SAMPLES} \
+    # --max_train_samples ${NUM_SAMPLES} \
+    # --max_eval_samples ${NUM_SAMPLES} \
+    # --max_test_samples ${NUM_SAMPLES} \
 

@@ -1,85 +1,108 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from torch.nn.utils import weight_norm
 
-class AutoEncoder(nn.Module):
-    #Multi layers (max 5) autoencoder with dropout 0.1 and LeakyRELU() activation
-    def __init__(self, input_dim, hidden_dim, output_dim):
-        super(AutoEncoder, self).__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LeakyReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim//2),
-            nn.LeakyReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim//2, hidden_dim//4),
-            nn.LeakyReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim//4, hidden_dim//8),
-            nn.LeakyReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim//8, hidden_dim//16),
-            nn.LeakyReLU()
-        )
-        self.decoder = nn.Sequential(
-            nn.Linear(hidden_dim//16, hidden_dim//8),
-            nn.LeakyReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim//8, hidden_dim//4),
-            nn.LeakyReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim//4, hidden_dim//2),
-            nn.LeakyReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim//2, hidden_dim),
-            nn.LeakyReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, output_dim),
-            nn.Sigmoid()
-        )
-    
-    def forward(self, x):
-        x = self.encoder(x)
-        x = self.decoder(x)
-        return x
+class Similarity(nn.Module):
+    """
+    Dot product or cosine similarity
+    """
 
-
-        
-
-class BiLSTM_Attention(nn.Module):
-    def __init__(self, embedding_dim = 768, n_hidden = 768):
+    def __init__(self, temp):
         super().__init__()
+        self.temp = temp
+        self.cos = nn.CosineSimilarity(dim=-1)
 
-        # self.embedding = nn.Embedding(vocab_size, embedding_dim)
-        self.lstm = nn.LSTM(embedding_dim, n_hidden, bidirectional=True, dropout=0.1, batch_first=True, num_layers=10)
-        self.out = nn.Linear(n_hidden * 2, n_hidden)
-        # self.ae = AutoEncoder(n_hidden, n_hidden//2, n_hidden)
+    def forward(self, x, y):
+        return self.cos(x, y) / self.temp
 
-    # lstm_output : [batch_size, n_step, n_hidden * num_directions(=2)], F matrix
-    def attention_net(self, lstm_output, final_state, n_hidden = 768):
-        hidden = final_state.view(-1, n_hidden * 2, 1)   # hidden : [batch_size, n_hidden * num_directions(=2), 1(=n_layer)]
-        attn_weights = torch.bmm(lstm_output, hidden).squeeze(2) # attn_weights : [batch_size, n_step]
-        soft_attn_weights = F.softmax(attn_weights, 1)
-        # [batch_size, n_hidden * num_directions(=2), n_step] * [batch_size, n_step, 1] = [batch_size, n_hidden * num_directions(=2), 1]
-        context = torch.bmm(lstm_output.transpose(1, 2), soft_attn_weights.unsqueeze(2)).squeeze(2)
-        return context, soft_attn_weights.data # context : [batch_size, n_hidden * num_directions(=2)]
+class Chomp1d(nn.Module):
+    def __init__(self, chomp_size):
+        super(Chomp1d, self).__init__()
+        self.chomp_size = chomp_size
 
-    def forward(self, X, n_hidden = 768):
-        # input = self.embedding(X) # input : [batch_size, len_seq, embedding_dim]
-        # input = X.permute(1, 0, 2) # input : [len_seq, batch_size, embedding_dim]
-
-        # hidden_state = Variable(torch.zeros(1*2, len(X), n_hidden)) # [num_layers(=1) * num_directions(=2), batch_size, n_hidden]
-        # cell_state = Variable(torch.zeros(1*2, len(X), n_hidden)) # [num_layers(=1) * num_directions(=2), batch_size, n_hidden]
-
-        # final_hidden_state, final_cell_state : [num_layers(=1) * num_directions(=2), batch_size, n_hidden]
-        output, (final_hidden_state, final_cell_state) = self.lstm(X)
-        # output = output.permute(1, 0, 2) # output : [batch_size, len_seq, n_hidden]
-        attn_output, attention = self.attention_net(output, final_hidden_state[-2:], n_hidden)
-        return self.out(attn_output) # model : [batch_size, num_classes], attention : [batch_size, n_step]
-        # Normalize
-        # ae_input = F.normalize(ae_input, p=2, dim=1)
-        # ae_output = self.ae(ae_input)
-        # return ae_input, ae_output
+    def forward(self, x):
+        return x[:, :, :-self.chomp_size].contiguous()
 
 
+class TemporalBlock(nn.Module):
+    def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.2):
+        super(TemporalBlock, self).__init__()
+        self.conv1 = weight_norm(nn.Conv1d(n_inputs, n_outputs, kernel_size,
+                                           stride=stride, padding=padding, dilation=dilation))
+        self.chomp1 = Chomp1d(padding)
+        self.relu1 = nn.ReLU()
+        self.dropout1 = nn.Dropout(dropout)
+
+        self.conv2 = weight_norm(nn.Conv1d(n_outputs, n_outputs, kernel_size,
+                                           stride=stride, padding=padding, dilation=dilation))
+        self.chomp2 = Chomp1d(padding)
+        self.relu2 = nn.ReLU()
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.net = nn.Sequential(self.conv1, self.chomp1, self.relu1, self.dropout1,
+                                 self.conv2, self.chomp2, self.relu2, self.dropout2)
+        self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
+        self.relu = nn.ReLU()
+        self.init_weights()
+
+    def init_weights(self):
+        self.conv1.weight.data.normal_(0, 0.01)
+        self.conv2.weight.data.normal_(0, 0.01)
+        if self.downsample is not None:
+            self.downsample.weight.data.normal_(0, 0.01)
+
+    def forward(self, x):
+        out = self.net(x)
+        res = x if self.downsample is None else self.downsample(x)
+        return self.relu(out + res)
+
+
+class TemporalConvNet(nn.Module):
+    def __init__(self, num_inputs, num_channels, kernel_size=2, dropout=0.2):
+        super(TemporalConvNet, self).__init__()
+        layers = []
+        num_levels = len(num_channels)
+        for i in range(num_levels):
+            dilation_size = 2 ** i
+            in_channels = num_inputs if i == 0 else num_channels[i-1]
+            out_channels = num_channels[i]
+            layers += [TemporalBlock(in_channels, out_channels, kernel_size, stride=1, dilation=dilation_size,
+                                     padding=(kernel_size-1) * dilation_size, dropout=dropout)]
+
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.network(x)
+    
+class TCN(nn.Module):
+
+    def __init__(self, input_size, output_size, num_channels,
+                 kernel_size=2, dropout=0.3, emb_dropout=0.1, tied_weights=False):
+        super(TCN, self).__init__()
+        # self.encoder = nn.Embedding(output_size, input_size)
+        self.tcn = TemporalConvNet(input_size, num_channels, kernel_size, dropout=dropout)
+
+        self.decoder = nn.Linear(num_channels[-1], output_size)
+        if tied_weights:
+            if num_channels[-1] != input_size:
+                raise ValueError('When using the tied flag, nhid must be equal to emsize')
+            self.decoder.weight = self.encoder.weight
+            print("Weight tied")
+        self.drop = nn.Dropout(emb_dropout)
+        self.emb_dropout = emb_dropout
+        self.init_weights()
+
+    def init_weights(self):
+        # self.encoder.weight.data.normal_(0, 0.01)
+        self.decoder.bias.data.fill_(0)
+        self.decoder.weight.data.normal_(0, 0.01)
+
+    def forward(self, input):
+        """Input ought to have dimension (N, C_in, L_in), where L_in is the seq_len; here the input is (N, L, C)"""
+        # emb = self.drop(self.encoder(input))
+        y = self.tcn(input.transpose(1, 2)).transpose(1, 2)
+        # Average pool
+        y = y.mean(dim=1)
+        y = self.decoder(y)
+      
+        return y.contiguous()
