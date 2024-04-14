@@ -156,7 +156,7 @@ def parse_args():
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=5e-5,
+        default=1e-5,
         help="Initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay to use.")
@@ -181,7 +181,7 @@ def parse_args():
         choices=["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"],
     )
     parser.add_argument(
-        "--num_warmup_steps", type=int, default=0, help="Number of steps for the warmup in the lr scheduler."
+        "--num_warmup_steps", type=int, default=10, help="Number of steps for the warmup in the lr scheduler."
     )
     parser.add_argument("--output_dir", type=str, default=None, help="Where to store the final model.")
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
@@ -753,7 +753,7 @@ def main():
     lr_scheduler = get_scheduler(
         name=args.lr_scheduler_type,
         optimizer=optimizer,
-        num_warmup_steps=args.num_warmup_steps * accelerator.num_processes,
+        num_warmup_steps=args.num_warmup_steps /100 * len(train_dataloader)  * accelerator.num_processes,
         num_training_steps=args.max_train_steps
         if overrode_max_train_steps
         else args.max_train_steps * accelerator.num_processes,
@@ -918,7 +918,7 @@ def main():
 
         labels = np.concatenate(labels)
         for k in K:
-            # predictions[k-1] = np.concatenate(predictions[k-1])
+            predictions[k-1] = np.concatenate(predictions[k-1])
             results = compute_metrics(predictions[k-1], labels)
             if results['f1'] > best_result:
                 best_result = results['f1']
@@ -1021,7 +1021,7 @@ def main():
         labels.append(accelerator.gather(batch["log_labels"]).cpu().numpy())
 
     # print(predictions)
-    # predictions = np.concatenate(predictions)
+    predictions = np.concatenate(predictions)
     labels = np.concatenate(labels)
 
     results = compute_metrics(predictions, labels, best_threshold)
