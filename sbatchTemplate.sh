@@ -9,7 +9,7 @@
 
 #SBATCH --nodes=1                   # How many nodes required? Usually 1
 #SBATCH --cpus-per-task=20           # Number of CPU to request for the job
-#SBATCH --mem=64GB                   # How much memory does your job require?
+#SBATCH --mem=96GB                   # How much memory does your job require?
 #SBATCH --gres=gpu:4                # Do you require GPUS? If not delete this line
 #SBATCH --time=05-00:00:00          # How long to run the job for? Jobs exceed this time will be terminated
                                     # Format <DD-HH:MM:SS> eg. 5 days 05-00:00:00
@@ -55,4 +55,4 @@ srun whichgpu
 # pip3 install -r requirements.txt
 
 # Submit your job to the cluster
-srun --gres=gpu:4 bash run_mlmlog.sh
+srun --gres=gpu:4 bash run_clm.sh
