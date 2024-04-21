@@ -5,10 +5,10 @@ class Vocab(object):
 
         self.stoi = {}
         self.itos = []
-
         for line in logs:
-            self.itos.extend(line)
+            self.itos.append(line)
         self.itos = list(set(self.itos))
+        print(f"Vocab size: {len(self.itos)}")
         self.unk_index = len(self.itos)
         self.stoi = {e: i for i, e in enumerate(self.itos)}
 

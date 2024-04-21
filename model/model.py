@@ -1,19 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.nn.utils import weight_norm
-
-class Similarity(nn.Module):
-    """
-    Dot product or cosine similarity
-    """
-
-    def __init__(self, temp):
-        super().__init__()
-        self.temp = temp
-        self.cos = nn.CosineSimilarity(dim=-1)
-
-    def forward(self, x, y):
-        return self.cos(x, y) / self.temp
+import torch.nn.functional as F
 
 class Chomp1d(nn.Module):
     def __init__(self, chomp_size):
@@ -73,36 +61,30 @@ class TemporalConvNet(nn.Module):
 
     def forward(self, x):
         return self.network(x)
-    
+
 class TCN(nn.Module):
 
     def __init__(self, input_size, output_size, num_channels,
-                 kernel_size=2, dropout=0.3, emb_dropout=0.1, tied_weights=False):
+                 kernel_size=4, dropout=0.1):
         super(TCN, self).__init__()
-        # self.encoder = nn.Embedding(output_size, input_size)
         self.tcn = TemporalConvNet(input_size, num_channels, kernel_size, dropout=dropout)
 
-        self.decoder = nn.Linear(num_channels[-1], output_size)
-        if tied_weights:
-            if num_channels[-1] != input_size:
-                raise ValueError('When using the tied flag, nhid must be equal to emsize')
-            self.decoder.weight = self.encoder.weight
-            print("Weight tied")
-        self.drop = nn.Dropout(emb_dropout)
-        self.emb_dropout = emb_dropout
-        self.init_weights()
+        self.encoder = nn.LSTM(input_size, 128, num_layers=10, batch_first=True, dropout=dropout, bidirectional=True)
 
-    def init_weights(self):
-        # self.encoder.weight.data.normal_(0, 0.01)
-        self.decoder.bias.data.fill_(0)
-        self.decoder.weight.data.normal_(0, 0.01)
+        self.decoder = nn.Sequential(
+            nn.Linear(2*128, output_size),
+            nn.LeakyReLU()
+        )
+
 
     def forward(self, input):
         """Input ought to have dimension (N, C_in, L_in), where L_in is the seq_len; here the input is (N, L, C)"""
-        # emb = self.drop(self.encoder(input))
-        y = self.tcn(input.transpose(1, 2)).transpose(1, 2)
-        # Average pool
-        y = y.mean(dim=1)
+        # y = self.tcn(input.transpose(1, 2)).transpose(1, 2)
+
+        y, _ = self.encoder(input)
+        y = y[:, -1, :]
+
         y = self.decoder(y)
-      
-        return y.contiguous()
+        return y
+        
+

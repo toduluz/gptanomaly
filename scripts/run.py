@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 import torch.nn as nn
 import torch.nn.functional as F
-from model.model import TCN, Similarity
+from model.model import TCN
 import transformers
 from transformers import (
     CONFIG_MAPPING,
@@ -38,7 +38,7 @@ from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
 from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score
 import numpy as np
-import info_nce
+from data.vocab import Vocab
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -312,6 +312,18 @@ def main():
             os.makedirs(args.output_dir, exist_ok=True)
     accelerator.wait_for_everyone()
 
+    if args.template_path is not None:
+        # Vocab
+        with open(args.template_path, "rb") as f:
+            templates = pd.read_csv(f)
+            print(len(templates['EventId']))
+            vocab = Vocab(templates['EventId'])
+            vocab.save_vocab(os.path.join(args.output_dir, "vocab.pkl"))
+        
+        # Load the vocab
+        vocab = Vocab.load_vocab(os.path.join(args.output_dir, "vocab.pkl"))
+        vocab_len = len(vocab)
+
     # In distributed training, the load_dataset function guarantee that only one local process can concurrently
     # download the dataset.
     if args.train_path is not None:
@@ -326,6 +338,7 @@ def main():
             # train_df['text'] = train_df['EventTemplate'].apply(lambda x: ' '.join(x))
             if args.normal_only:
                 train_df = train_df[train_df['Label'] == 0].reset_index(drop=True)
+                train_df['vocab_label'] = train_df['EventId'].apply(lambda x: vocab.get_event(x[-1]))
             if args.max_train_samples and args.max_eval_samples:
                 train_df = train_df.sample(args.max_train_samples + int(args.validation_split_percentage / 100 * args.max_eval_samples)).reset_index(drop=True)
     if args.test_path is not None:
@@ -338,6 +351,8 @@ def main():
                 test_df['Label'] = test_df['Label'].apply(max)
             if args.max_test_samples:
                 test_df = test_df.sample(args.max_test_samples).reset_index(drop=True)
+            
+            test_df['vocab_label'] = test_df['EventId'].apply(lambda x: vocab.get_event(x[-1]))
             # test_df['text'] = test_df['EventTemplate'].apply(lambda x: ' '.join(x))
 
     
@@ -381,7 +396,7 @@ def main():
     
     print("*" * 100)
 
-    model = TCN(768, 768, [512, 256, 128, 64], kernel_size=2, dropout=0.1, emb_dropout=0.1, tied_weights=False)
+    model = TCN(768, vocab_len, [512, 256, 128])
     # if args.model_name_or_path:
     #     model = AutoModelForMaskedLM.from_pretrained(
     #         args.model_name_or_path,
@@ -448,7 +463,7 @@ def main():
                 input_ids = tokenizer.encode(eventTemplate, truncation=True, max_length=max_seq_length, return_tensors="pt")
                 # Get embeddings
                 with torch.no_grad():
-                    template_embeddings[eventId] = (encoder(input_ids=input_ids.to(accelerator.device)).last_hidden_state[:, 0, :].squeeze(0).detach().cpu())
+                    template_embeddings[eventId] = (encoder(input_ids=input_ids.to(accelerator.device)).last_hidden_state[:, -1, :].squeeze(0).detach().cpu())
             
             # Save the embeddings
             with open(args.output_dir + "/embeddings.pkl", "wb") as f:
@@ -485,6 +500,7 @@ def main():
             #             embeddings.append(embedding)
             #     batch['embedding'] = embeddings
             #     del batch['inputs']
+            batch['vocab_label'] = examples['vocab_label']
             
             batch['log_labels'] = examples['Label']
 
@@ -716,37 +732,11 @@ def main():
     progress_bar.update(completed_steps)
 
     best_loss = float("inf")
-    best_epoch = None
-    loss_fct = nn.MSELoss()
-    ctr_sim = Similarity(temp=0.5)
-    ctr_loss = nn.CrossEntropyLoss()
-    best_center = None
-
-
-    def get_radius(dist: list, nu: float = 0.2):
-        """Optimally solve for radius R via the (1-nu)-quantile of distances."""
-        return np.quantile(dist, 1 - nu)
-
+    best_model_dir = None
+    loss_fct = nn.CrossEntropyLoss()
 
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
-
-        # Get center from both traindataloader and evaldataloader
-        center = 0
-        total_samples = 0
-        for step, batch in enumerate(train_dataloader):
-            with torch.no_grad():
-                ae_output = model(batch['embedding'])
-            # print(ae_output.shape)
-            center += torch.sum(ae_output, dim=0).detach().clone()
-            total_samples += len(batch['embedding'])
-        for step, batch in enumerate(eval_dataloader):
-            with torch.no_grad():
-                ae_output = model(batch['embedding'])
-            center += torch.sum(ae_output, dim=0).detach().clone()
-            total_samples += len(batch['embedding'])
-        center /= total_samples
-        # print(center.shape)
 
         total_loss = 0
         if args.with_tracking:
@@ -762,31 +752,9 @@ def main():
             with accelerator.accumulate(model):
                 
 
-                ae_output = model(batch['embedding'])
+                output = model(batch['embedding'])
 
-                # Calculate the number of elements to zero out
-                num_to_zero_out = int(0.15 * batch['embedding'].shape[1])
-
-                randomly_zeroed_out = torch.randperm(batch['embedding'].shape[1])[:num_to_zero_out]
-
-                # Zero out the elements
-                masked_input = batch['embedding'].clone()
-                masked_input[:, randomly_zeroed_out] = 0
-
-                masked_output = model(masked_input)
-
-                # L2 loss between output and center
-                # loss = loss_fct(ae_output, ae_input) * 0.1
-                loss = loss_fct(ae_output, center.expand_as(ae_output))
-                dist =  torch.sqrt(torch.sum((ae_output - center) ** 2, dim=1))
-            
-                dists.append(accelerator.gather_for_metrics(dist.detach().clone()))
-
-                # Contrastive loss
-                cos_sim = ctr_sim(ae_output.unsqueeze(1), masked_output.unsqueeze(0))
-                labe = torch.arange(cos_sim.size(0)).long().to(accelerator.device)
-                c_loss = ctr_loss(cos_sim, labe)
-                loss += c_loss * 0.2
+                loss = loss_fct(output, batch['vocab_label'])
 
                 # We keep track of the loss at each epoch
                 total_loss += loss.detach().float()
@@ -817,38 +785,17 @@ def main():
 
         model.eval()
         eval_losses = []
-        
         for step, batch in enumerate(eval_dataloader):
             with torch.no_grad():
-               ae_output = model(batch['embedding'])
-               
-               # Calculate the number of elements to zero out
-               num_to_zero_out = int(0.15 * batch['embedding'].shape[1])
-               randomly_zeroed_out = torch.randperm(batch['embedding'].shape[1])[:num_to_zero_out]
-               # Zero out the elements
-               masked_input = batch['embedding'].clone()
-               masked_input[:, randomly_zeroed_out] = 0
-               masked_output = model(masked_input)
-            #    print(ae_output, masked_output)
-            # loss = loss_fct(ae_output, ae_input) * 0.1
-            loss = loss_fct(ae_output, center.expand_as(ae_output))
+                output = model(batch['embedding'])
+            
+            loss = loss_fct(output, batch['vocab_label'])
 
-           # Contrastive loss
-            cos_sim = ctr_sim(ae_output.unsqueeze(1), masked_output.unsqueeze(0))
-            labe = torch.arange(cos_sim.size(0)).long().to(accelerator.device)
-            c_loss = ctr_loss(cos_sim, labe)
-            loss += c_loss * 0.2
-
-            dist =  torch.sqrt(torch.sum((ae_output - center) ** 2, dim=1))
-            dists.append(accelerator.gather_for_metrics(dist.detach().clone()))
             eval_losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
 
         losses = torch.cat(eval_losses)
         eval_loss = torch.mean(losses)
-        dists = torch.cat(dists)
         logger.info(f"epoch: {epoch} eval_loss: {eval_loss}")
-
-
 
         # if args.with_tracking:
         #     accelerator.log(
@@ -863,14 +810,8 @@ def main():
         #     )
 
         if eval_loss < best_loss:
-            best_loss = eval_loss
+            best_loss = eval_loss.item()
             best_model_dir = f"epoch_{epoch}"
-            # print(dists)
-            radius = get_radius(dists.tolist())
-            best_center = center
-            # Save the best threshold as pickle
-            with open(os.path.join(args.output_dir, "best_threshold.pkl"), "wb") as f:
-                pickle.dump((radius, best_center), f)
 
             epochs_no_improve = 0
         else:
@@ -918,42 +859,53 @@ def main():
     logger.info("Loading best checkpoint from: %s", os.path.join(args.output_dir, best_model_dir))
     accelerator.load_state(os.path.join(args.output_dir, best_model_dir))
     model.eval()
-    # Load best threshold too
-    with open(os.path.join(args.output_dir, "best_threshold.pkl"), "rb") as f:
-        radius, center = pickle.load(f)
+
     accelerator.wait_for_everyone()
 
     log_labels = []
-    test_dists = []
+    logits = []
+    vocab_label = []
 
     for steps, batch in enumerate(test_dataloader):
         with torch.no_grad():
-            ae_output = model(batch['embedding'])
-        dist =  torch.sqrt(torch.sum((ae_output - center) ** 2, dim=1))
+            output = model(batch['embedding'])
+        
 
-        test_dists.append(accelerator.gather_for_metrics(dist))
+        logits.append(accelerator.gather_for_metrics(output).cpu().numpy())
+        vocab_label.append(accelerator.gather_for_metrics(batch['vocab_label']).cpu().numpy())
         log_labels.append(accelerator.gather_for_metrics(batch["log_labels"]).cpu().numpy())
 
 
-    def compute_for_metrics(test_dists, log_labels, radius):
+    def compute_for_metrics(logits, vocab_label, log_labels):
         """Compute metrics for the test set."""
-        # Compute the metrics
-        y_pred = test_dists > radius
-        y_true = log_labels
-        f1 = f1_score(y_true, y_pred)
-        precision = precision_score(y_true, y_pred)
-        recall = recall_score(y_true, y_pred)
-        accuracy = accuracy_score(y_true, y_pred)
+        best_f1 = 0
+        best_k = 0
+        best_recall = 0
+        best_precision = 0
+        best_accuracy = 0
+        for i in range(1, 50):
+            k = i
+            top_k = np.argsort(logits, axis=1)[:, -k:]
+            preds = [1 if vocab_label[n] in top_k[n] else 0 for n in range(len(vocab_label))]
+            f1 = f1_score(log_labels, preds)
+            if f1 > best_f1:
+                best_f1 = f1
+                best_k = k
+                best_recall = recall_score(log_labels, preds)
+                best_precision = precision_score(log_labels, preds)
+                best_accuracy = accuracy_score(log_labels, preds)
         return {
-            "f1": f1,
-            "precision": precision,
-            "recall": recall,
-            "accuracy": accuracy,
+            "f1": best_f1,
+            "k": best_k,
+            "recall": best_recall,
+            "precision": best_precision,
+            "accuracy": best_accuracy,
         }
 
     log_labels = np.concatenate(log_labels)
-    test_dists = torch.cat(test_dists).cpu().numpy()
-    results = compute_for_metrics(test_dists, log_labels, radius)
+    logits = np.concatenate(logits)
+    vocab_label = np.concatenate(vocab_label)
+    results = compute_for_metrics(logits, vocab_label, log_labels)
     logger.info(f"{results}")
 
     if args.with_tracking:
