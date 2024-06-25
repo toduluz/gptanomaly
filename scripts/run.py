@@ -23,7 +23,8 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 import torch.nn as nn
 import torch.nn.functional as F
-from model.model import TCN
+from model.lstm import LogRobust
+from model.bert import BERT
 import transformers
 from transformers import (
     CONFIG_MAPPING,
@@ -39,6 +40,8 @@ from transformers.utils.versions import require_version
 from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score
 import numpy as np
 from data.vocab import Vocab
+from transformers import RobertaConfig, RobertaModel, RobertaForMaskedLM
+from info_nce import InfoNCE
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -258,7 +261,7 @@ def parse_args():
     parser.add_argument(
         "--normal_only",
         type=bool,
-        default=True,
+        default=False,
         help="If passed, will only use normal samples for training and testing.",
     )
     parser.add_argument(
@@ -322,7 +325,7 @@ def main():
         
         # Load the vocab
         vocab = Vocab.load_vocab(os.path.join(args.output_dir, "vocab.pkl"))
-        vocab_len = len(vocab)
+        vocab_len = len(vocab) + 2
 
     # In distributed training, the load_dataset function guarantee that only one local process can concurrently
     # download the dataset.
@@ -338,9 +341,14 @@ def main():
             # train_df['text'] = train_df['EventTemplate'].apply(lambda x: ' '.join(x))
             if args.normal_only:
                 train_df = train_df[train_df['Label'] == 0].reset_index(drop=True)
-                train_df['vocab_label'] = train_df['EventId'].apply(lambda x: vocab.get_event(x[-1]))
+            train_df['vocab_label'] = train_df['EventId'].apply(lambda x: [vocab.get_event(b)for b in x])
+                # train_df['vocab_label'] = train_df['EventId'].apply(lambda x: vocab.get_event(x[-1]))
+            print(train_df['EventId'].head(5))
+            print(train_df['vocab_label'].head(5))
             if args.max_train_samples and args.max_eval_samples:
                 train_df = train_df.sample(args.max_train_samples + int(args.validation_split_percentage / 100 * args.max_eval_samples)).reset_index(drop=True)
+            maximum_length = max(train_df['EventId'].apply(len))
+            print("train len ", len(train_df))
     if args.test_path is not None:
         with open(args.test_path, "rb") as f:
             test_data = pickle.load(f)
@@ -352,9 +360,14 @@ def main():
             if args.max_test_samples:
                 test_df = test_df.sample(args.max_test_samples).reset_index(drop=True)
             
-            test_df['vocab_label'] = test_df['EventId'].apply(lambda x: vocab.get_event(x[-1]))
+            test_df['vocab_label'] = test_df['EventId'].apply(lambda x: [vocab.get_event(b)for b in x])
+            # test_df['vocab_label'] = test_df['EventId'].apply(lambda x: vocab.get_event(x[-1]))
             # test_df['text'] = test_df['EventTemplate'].apply(lambda x: ' '.join(x))
-
+            print(test_df['EventId'].head(5))
+            print(test_df['vocab_label'].head(5))
+            print("test len ", len(test_df))
+            maximum_length = max(maximum_length, max(test_df['EventId'].apply(len)))
+    print("The maximum length is: ", maximum_length)
     
     # Load the dataset
     raw_datasets = datasets.Dataset.from_pandas(train_df).train_test_split(
@@ -377,7 +390,7 @@ def main():
     
     if args.encoder_name_or_path:
         encoder_config = AutoConfig.from_pretrained(args.encoder_name_or_path, trust_remote_code=args.trust_remote_code)
-
+    
     print("*" * 100)
 
     if args.tokenizer_name:
@@ -396,7 +409,6 @@ def main():
     
     print("*" * 100)
 
-    model = TCN(768, vocab_len, [512, 256, 128])
     # if args.model_name_or_path:
     #     model = AutoModelForMaskedLM.from_pretrained(
     #         args.model_name_or_path,
@@ -418,6 +430,7 @@ def main():
             trust_remote_code=args.trust_remote_code,
         )
 
+    model = BERT(vocab_size=vocab_len, max_len=maximum_length, hidden=768, n_layers=2, attn_heads=12, dropout=0.2, is_logkey=True, is_time=False)
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
     embedding_size = encoder.get_input_embeddings().weight.shape[0]
@@ -463,11 +476,16 @@ def main():
                 input_ids = tokenizer.encode(eventTemplate, truncation=True, max_length=max_seq_length, return_tensors="pt")
                 # Get embeddings
                 with torch.no_grad():
-                    template_embeddings[eventId] = (encoder(input_ids=input_ids.to(accelerator.device)).last_hidden_state[:, -1, :].squeeze(0).detach().cpu())
+                    template_embeddings[eventTemplate] = (encoder(input_ids=input_ids.to(accelerator.device)).last_hidden_state.mean(dim=1).squeeze(0).detach().cpu())
             
             # Save the embeddings
             with open(args.output_dir + "/embeddings.pkl", "wb") as f:
                 pickle.dump(template_embeddings, f)
+            # Save as json too
+            # Convert tensors to lists
+            template_embeddings = {k: v.tolist() for k, v in template_embeddings.items()}
+            with open(args.output_dir + "/embeddings.json", "w") as f:
+                json.dump(template_embeddings, f)
         
         accelerator.wait_for_everyone()
         # Load the embeddings
@@ -483,7 +501,7 @@ def main():
 
             if template_embeddings is not None:
                 # Get the eventId to convert to embeddings later on
-                batch['EventId'] = examples['EventId'] 
+                batch['EventTemplate'] = examples['EventTemplate'] 
             #     # Get the embeddings for the event templates
             #     embeddings = []
             #     for eventIds in examples['EventId']:
@@ -491,15 +509,17 @@ def main():
             #         embeddings.append(sent_embeddings)
             #     batch['embedding'] = embeddings
             # else:
-            #     batch['inputs'] = [tokenizer(text, truncation=True, padding=padding, max_length=max_seq_length, return_tensors="pt") for text in examples[text_column_name]]
-            #     embeddings = []
-            #     with torch.no_grad():
-            #         for input in batch['inputs']:
-            #             input.to(accelerator.device)
-            #             embedding = encoder(input_ids=input['input_ids'], attention_mask=input['attention_mask']).last_hidden_state[:, 0, :].squeeze(0).detach().cpu()
-            #             embeddings.append(embedding)
-            #     batch['embedding'] = embeddings
-            #     del batch['inputs']
+            # bn = [[tokenizer.encode(t, truncation=True, max_length=max_seq_length, return_tensors="pt") for t in text] for text in examples[text_column_name]]
+            # embeddings = []
+            # with torch.no_grad():
+            #     for input in bn:
+            #         tmp = []
+            #         for item in input:
+            #             output = encoder(input_ids=item.to(accelerator.device)).last_hidden_state[:, 0, :].squeeze(0).detach().cpu()
+            #             tmp.append(output)
+            #         embeddings.append(tmp)
+            # batch['embedding'] = embeddings
+
             batch['vocab_label'] = examples['vocab_label']
             
             batch['log_labels'] = examples['Label']
@@ -514,7 +534,11 @@ def main():
                 remove_columns=[*column_names],
                 load_from_cache_file=not args.overwrite_cache,
                 desc="Running tokenizer on dataset line_by_line",
+                batch_size=args.per_device_train_batch_size,
             )
+        
+        # Save the tokenized datasets
+
     else:
         # Otherwise, we tokenize every text, then concatenate them together before splitting them in smaller parts.
         # We use `return_special_tokens_mask=True` because DataCollatorForLanguageModeling (see below) is more
@@ -587,23 +611,31 @@ def main():
     def collate_fn(batch):
         output = {}
         for key in batch[0].keys():
-            # if key == 'embedding':
-            #     # Pad!
-            #     max_length = max([len(x[key]) for x in batch])
+            if key == 'embedding':
+                # Pad!
+                max_length = max([len(x[key]) for x in batch])
+                max_length = maximum_length
                 
-            #     padded_batch = [torch.cat((torch.tensor(x[key]), torch.zeros(max_length - len(x[key]), len(x[key][0])))) if len(x[key]) < max_length else torch.tensor(x[key]) for x in batch]
-            #     output[key] = torch.stack(padded_batch)
-            if key == 'EventId':
+                padded_batch = [torch.cat((torch.tensor(x[key]), torch.zeros(max_length - len(x[key]), len(x[key][0])))) if len(x[key]) < max_length else torch.tensor(x[key]) for x in batch]
+                output[key] = torch.stack(padded_batch)
+            if key == 'EventTemplate':
                 # Convert to embeddings
                 embeddings = []
                 for b in batch:
                     sent_embeddings = torch.stack([template_embeddings[eventId] for eventId in b[key]])
                     embeddings.append(sent_embeddings)
-                
+
                 # Pad!
                 max_length = max([x.shape[0] for x in embeddings])
+                max_length = maximum_length
                 padded_batch = [torch.cat((x, torch.zeros(max_length - x.shape[0], x.shape[1]))) if len(x) < max_length else x for x in embeddings]
                 output['embedding'] = torch.stack(padded_batch)
+            elif key == 'vocab_label':
+                # PAD with 0 ! 
+                max_length = max([len(x[key]) for x in batch])
+                max_length = maximum_length
+                padded_batch = [x[key] + [0] * (max_length - len(x[key])) for x in batch]
+                output[key] = torch.tensor(padded_batch)
             else:
                 output[key] = torch.stack([torch.tensor(x[key]) for x in batch])
         # Generate the last of the 
@@ -656,7 +688,7 @@ def main():
     )
 
     # Prepare everything with our `accelerator`.
-    model, optimizer, train_dataloader, eval_dataloader, test_dataloader, lr_scheduler = accelerator.prepare(
+    model, optimizer, train_dataloader, eval_dataloader, test_dataloader, lr_scheduler, = accelerator.prepare(
         model, optimizer, train_dataloader, eval_dataloader, test_dataloader, lr_scheduler
     )
 
@@ -746,15 +778,26 @@ def main():
             active_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
         else:
             active_dataloader = train_dataloader
-
-        dists = []
         for step, batch in enumerate(active_dataloader):
             with accelerator.accumulate(model):
+
+                # mask = torch.rand(batch['vocab_label'].shape) < args.mlm_probability
+
+                # # inputs_a = batch['vocab_label'].clone()
+                # # inputs_a[mask] = 0
+
+                # batch_embed_mask = mask.unsqueeze(-1).expand_as(batch['embedding'])
+                # emb_imp = batch['embedding'].clone()
+                # emb_imp[batch_embed_mask] = -0.001
+
+                # labels = batch['vocab_label'].clone()
+                # labels[~mask] = 0
+        
+                v = model(batch['embedding'])
+
+                loss = loss_fct(v, batch['log_labels'].view(-1))
+    
                 
-
-                output = model(batch['embedding'])
-
-                loss = loss_fct(output, batch['vocab_label'])
 
                 # We keep track of the loss at each epoch
                 total_loss += loss.detach().float()
@@ -785,16 +828,30 @@ def main():
 
         model.eval()
         eval_losses = []
+ 
         for step, batch in enumerate(eval_dataloader):
             with torch.no_grad():
-                output = model(batch['embedding'])
-            
-            loss = loss_fct(output, batch['vocab_label'])
+        
+                # mask = torch.rand(batch['vocab_label'].shape) < args.mlm_probability
 
+                # # inputs_a = batch['vocab_label'].clone()
+                # # inputs_a[mask] = 0
+
+                # batch_embed_mask = mask.unsqueeze(-1).expand_as(batch['embedding'])
+                # emb_imp = batch['embedding'].clone()
+                # emb_imp[batch_embed_mask] = -0.001
+
+                # labels = batch['vocab_label'].clone()
+                # labels[~mask] = 0
+        
+                v = model(batch['embedding'])
+                loss = loss_fct(v, batch['log_labels'].view(-1))
+              
             eval_losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
 
         losses = torch.cat(eval_losses)
         eval_loss = torch.mean(losses)
+
         logger.info(f"epoch: {epoch} eval_loss: {eval_loss}")
 
         # if args.with_tracking:
@@ -812,7 +869,6 @@ def main():
         if eval_loss < best_loss:
             best_loss = eval_loss.item()
             best_model_dir = f"epoch_{epoch}"
-
             epochs_no_improve = 0
         else:
             epochs_no_improve += 1
@@ -868,44 +924,138 @@ def main():
 
     for steps, batch in enumerate(test_dataloader):
         with torch.no_grad():
-            output = model(batch['embedding'])
+
+            
+            # mask = torch.rand(batch['vocab_label'].shape) < args.mlm_probability
+
+            # # inputs_a = batch['vocab_label'].clone()
+            # # inputs_a[mask] = 0
+
+            # batch_embed_mask = mask.unsqueeze(-1).expand_as(batch['embedding'])
+            # emb_imp = batch['embedding'].clone()
+            # emb_imp[batch_embed_mask] = -0.001
+
+            # labels = batch['vocab_label'].clone()
+            # labels[~mask] = 0
+    
+            v = model(batch['embedding'])
+
         
-
-        logits.append(accelerator.gather_for_metrics(output).cpu().numpy())
-        vocab_label.append(accelerator.gather_for_metrics(batch['vocab_label']).cpu().numpy())
+        logits.append(accelerator.gather_for_metrics(v.cpu().numpy()))
         log_labels.append(accelerator.gather_for_metrics(batch["log_labels"]).cpu().numpy())
+        # vocab_label.append(accelerator.gather_for_metrics(labels.cpu().numpy()))
 
 
-    def compute_for_metrics(logits, vocab_label, log_labels):
-        """Compute metrics for the test set."""
-        best_f1 = 0
-        best_k = 0
-        best_recall = 0
-        best_precision = 0
-        best_accuracy = 0
-        for i in range(1, 50):
-            k = i
-            top_k = np.argsort(logits, axis=1)[:, -k:]
-            preds = [1 if vocab_label[n] in top_k[n] else 0 for n in range(len(vocab_label))]
-            f1 = f1_score(log_labels, preds)
-            if f1 > best_f1:
-                best_f1 = f1
-                best_k = k
-                best_recall = recall_score(log_labels, preds)
-                best_precision = precision_score(log_labels, preds)
-                best_accuracy = accuracy_score(log_labels, preds)
+    logits = np.concatenate(logits)
+    log_labels = np.concatenate(log_labels)
+    # vocab_label = np.concatenate(vocab_label)
+
+    # def compute_for_metrics(logits, vocab_label, log_labels):
+    #     best_f1 = 0
+    #     best_precision = 0
+    #     best_recall = 0
+    #     best_threshold = 0
+    #     best_k = 0
+    #     best_accuracy = 0
+
+   
+    #     for k in [10, 20, 30, 50, 80, 100]:
+    #         scores = []
+    #         for i in range(len(logits)):
+    #             topk = np.argsort(logits[i], axis=-1)[:, -k:]
+
+    #             select_top_k = [topk[j] for j in range(len(topk)) if vocab_label[i][j] != 0]
+    #             select_label = [vocab_label[i][j] for j in range(len(vocab_label[i])) if vocab_label[i][j] != 0]
+
+    #             p = [1 if select_label[l] in select_top_k[l] else 0 for l in range(len(select_top_k))]
+    #             if len(select_top_k) == 0:
+    #                 scores.append(0)
+    #                 continue
+    #             score = sum(p) / len(select_top_k)
+    #             scores.append(score)
+
+    #         for t in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
+     
+    #             preds = [0 if s >= t else 1 for s in scores]
+    #             f1 = f1_score(log_labels, preds)
+    #             precision = precision_score(log_labels, preds)
+    #             recall = recall_score(log_labels, preds)
+    #             accuracy = accuracy_score(log_labels, preds)
+    #             print("F1 is {} and threshold is {} and k is {} and precision is {} and recall is {} and accuracy is {}".format(f1, t, k, precision, recall, accuracy))
+    #             if f1 > best_f1:
+    #                 best_f1 = f1
+    #                 best_threshold = t
+    #                 best_k = k
+    #                 best_precision = precision
+    #                 best_recall = recall
+    #                 best_accuracy = accuracy
+        
+    #     return {
+    #         "f1": best_f1,
+    #         "precision": best_precision,
+    #         "recall": best_recall,
+    #         "threshold": best_threshold,
+    #         "k": best_k,
+    #         "accuracy": best_accuracy
+    #     }
+
+    # def compute_for_metrics(logits, vocab_label, log_labels):
+    #     best_f1 = 0
+    #     best_precision = 0
+    #     best_recall = 0
+    #     best_threshold = 0
+    #     best_accuracy = 0
+
+    #     pred = logits.argmax(axis=-1)
+
+    #     s = []
+
+    #     for i in range(len(logits)):
+    #         sccc = [1 if pred[i][j] == vocab_label[i][j] else 0 for j in range(len(pred[i]))]
+    #         score = sum(sccc) / len(pred[i])
+    #         s.append(score)
+        
+    #     for t in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
+    #         preds = [0 if s >= t else 1 for s in s]
+    #         f1 = f1_score(log_labels, preds)
+    #         precision = precision_score(log_labels, preds)
+    #         recall = recall_score(log_labels, preds)
+    #         accuracy = accuracy_score(log_labels, preds)
+    #         print("F1 is {} and threshold is {} and precision is {} and recall is {} and accuracy is {}".format(f1, t, precision, recall, accuracy))
+    #         if f1 > best_f1:
+    #             best_f1 = f1
+    #             best_threshold = t
+    #             best_precision = precision
+    #             best_recall = recall
+    #             best_accuracy = accuracy
+        
+    #     return {
+    #         "f1": best_f1,
+    #         "precision": best_precision,
+    #         "recall": best_recall,
+    #         "threshold": best_threshold,
+    #         "accuracy": best_accuracy
+    #     }
+
+    def compute_for_metrics(logits, log_labels):
+        s = np.sum(log_labels)
+        print(s, log_labels.shape)
+        preds = logits.argmax(axis=-1)
+        p = np.sum(preds)
+        print(p)
+        f1 = f1_score(log_labels, preds)
+        precision = precision_score(log_labels, preds)
+        recall = recall_score(log_labels, preds)
+        accuracy = accuracy_score(log_labels, preds)
+
         return {
-            "f1": best_f1,
-            "k": best_k,
-            "recall": best_recall,
-            "precision": best_precision,
-            "accuracy": best_accuracy,
+            "f1": f1,
+            "precision": precision,
+            "recall": recall,
+            "accuracy": accuracy
         }
 
-    log_labels = np.concatenate(log_labels)
-    logits = np.concatenate(logits)
-    vocab_label = np.concatenate(vocab_label)
-    results = compute_for_metrics(logits, vocab_label, log_labels)
+    results = compute_for_metrics(logits, log_labels)
     logger.info(f"{results}")
 
     if args.with_tracking:

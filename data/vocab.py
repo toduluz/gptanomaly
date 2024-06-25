@@ -9,8 +9,8 @@ class Vocab(object):
             self.itos.append(line)
         self.itos = list(set(self.itos))
         print(f"Vocab size: {len(self.itos)}")
-        self.unk_index = len(self.itos)
-        self.stoi = {e: i for i, e in enumerate(self.itos)}
+        self.unk_index = len(self.itos)+1
+        self.stoi = {e: i+1 for i, e in enumerate(self.itos)}
 
     def __len__(self):
         return len(self.itos)

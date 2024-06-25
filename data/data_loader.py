@@ -114,13 +114,8 @@ def process_dataset(logger: Logger,
 
 
 if __name__ == '__main__':
-    data = "Thunderbird"
-    if data == "HDFS":
-        group = "session"
-    else:
-        group = "sliding"
-    process_dataset(Logger(data),
-                    data_dir="../../dataset/"+data, output_dir="../../dataset/"+data, log_file=data+".log",
-                    dataset_name=data,
-                    grouping=group, window_size=60, step_size=60, train_size=0.8, is_chronological=True,
+    process_dataset(Logger("BGL"),
+                    data_dir="../../dataset/BGL", output_dir="../../dataset/BGL", log_file="BGL.log",
+                    dataset_name="bgl",
+                    grouping="sliding", window_size=50, step_size=50, train_size=0.8, is_chronological=True,
                     session_type="entry")

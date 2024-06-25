@@ -875,11 +875,11 @@ def main():
 
         model.eval()
         labels = []
-        K = [x for x in range(1, 100)]
-        predictions = [[] for _ in range(1, 100)]
+        K = [5, 10, 20, 50, 100]
+        predictions = dict()
         for step, batch in enumerate(eval_dataloader):
             # Initialize a list of lists for the matches
-            matches = [[] for _ in range(1, 100)]
+            matches = dict()
             vocab_len = batch['vocab_index'].shape[1]
             for i in range(vocab_len):
                 
@@ -901,23 +901,31 @@ def main():
                     # Get 1 if any true
                     match = match.any(dim=-1).float()
                     # print(match)
-                    matches[k-1].append(match)
+                    if k not in matches:
+                        matches[k] = []
+                        matches[k].append(match)
+                    else:
+                        matches[k].append(match)
                 
                 # Append next token to input_ids
-                # batch['input_ids'] = torch.cat([batch['input_ids'], batch['vocab_index'][:, i].unsqueeze(0)], dim=1)
-                batch['input_ids'] = torch.cat([batch['input_ids'], torch.argmax(next_token_logits, dim=-1).unsqueeze(1)], dim=1)
+                batch['input_ids'] = torch.cat([batch['input_ids'], batch['vocab_index'][:, i].unsqueeze(0)], dim=1)
+                # batch['input_ids'] = torch.cat([batch['input_ids'], torch.argmax(next_token_logits, dim=-1).unsqueeze(1)], dim=1)
                 batch['attention_mask'] = torch.cat([batch['attention_mask'], torch.ones((batch['attention_mask'].shape[0], 1), device=accelerator.device)], dim=1)
 
             for k in K:
-                average_matches = torch.sum(torch.cat(matches[k-1])) / vocab_len
-                predictions[k-1].append(accelerator.gather_for_metrics(average_matches).cpu().numpy())
+                average_matches = torch.sum(torch.cat(matches[k])) / vocab_len
+                if k not in predictions:
+                    predictions[k] = []
+                    predictions[k].append(accelerator.gather_for_metrics(average_matches).cpu().numpy())
+                else:
+                    predictions[k].append(accelerator.gather_for_metrics(average_matches).cpu().numpy())
 
             labels.append(accelerator.gather_for_metrics(batch["log_labels"]).cpu().numpy())
 
         labels = np.concatenate(labels)
         for k in K:
-            predictions[k-1] = np.concatenate(predictions[k-1])
-            results = compute_metrics(predictions[k-1], labels)
+            # predictions[k] = np.concatenate(predictions[k])
+            results = compute_metrics(predictions[k], labels)
             if results['f1'] > best_result:
                 best_result = results['f1']
                 best_k = k
@@ -1019,7 +1027,7 @@ def main():
         labels.append(accelerator.gather(batch["log_labels"]).cpu().numpy())
 
     # print(predictions)
-    predictions = np.concatenate(predictions)
+    # predictions = np.concatenate(predictions)
     labels = np.concatenate(labels)
 
     results = compute_metrics(predictions, labels, best_threshold)
